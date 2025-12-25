@@ -1,0 +1,15 @@
+[package]
+version = "1.0.0"
+category = "My Projects"
+title = "Hospital Lab Robot"
+description = "Nova Carter + UR10 Integration"
+authors = ["JY"]
+repository = ""
+keywords = ["isaac", "ros2", "manipulation"]
+changelog = "docs/CHANGELOG.md"
+readme = "docs/README.md"
+preview_image = "data/preview.png"
+icon = "data/icon.png"
+
+[[python.module]]
+name = "rokey_lab_robot"

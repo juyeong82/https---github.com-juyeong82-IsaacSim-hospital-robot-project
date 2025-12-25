@@ -1,0 +1,25 @@
+# --- System & Python ---
+pycache/
+*.pyc
+*.zip
+.vscode/
+.idea/
+
+# --- ROS 2 Build Files (업로드 금지) ---
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# --- Isaac Sim Cache Assets (AWS 폴더 제외) ---
+# 사용자가 요청한 아이작심 기본 에셋 폴더를 모든 하위 경로에서 무시
+**/omniverse-content-production.s3-us-west-2.amazonaws.com/
+
+#--- Isaac Sim Temp Files ---
+**/.collect.mapping.json
+*.ov
+*.log
+
+# --- Unused Assets (사용자 요청 제외) ---
+# 원본 백업 및 수집 과정에서 생긴 중복 폴더 제외
+assets/Collected_nova v9 original/
+assets/Collected_nova v9/
