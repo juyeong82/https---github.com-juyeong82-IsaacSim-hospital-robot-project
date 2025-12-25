@@ -1,0 +1,12 @@
+# [Goal]
+string action_type       # "pick", "place", "home", "move_to_pose"
+geometry_msgs/PoseStamped target_pose  # 목pick, place용 (RMPFlow)
+float64[] joint_angles   # home, move_to_joint용 (Joint Control)
+---
+# [Result]
+bool success             # 성공 여부
+string message           # 결과 메시지 (예: "Grasping Completed")
+---
+# [Feedback]
+string current_state     # 현재 상태 (예: "Moving", "Approaching", "Grasping")
+float32 distance_remaining # 목표까지 남은 거리

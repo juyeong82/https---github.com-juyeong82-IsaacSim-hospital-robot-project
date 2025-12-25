@@ -6,21 +6,19 @@ import cv2
 import numpy as np
 import tf2_ros
 from geometry_msgs.msg import PoseStamped
+from moma_interfaces.msg import MarkerArray, MarkerInfo
 import tf2_geometry_msgs
 from scipy.spatial.transform import Rotation
+from std_msgs.msg import Bool
 
 class ArucoDetector(Node):
     def __init__(self):
-        super().__init__('aruco_detector_v2')
+        super().__init__('aruco_detector_left')
         
-        # [수정] 마커 및 검출기 설정 (OpenCV 4.7+ 대응)
+        # 마커 및 검출기 설정 (OpenCV 4.7+ 대응)
         self.marker_size = 0.13
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        
-        # 1. 파라미터 생성자 변경 (_create 함수 삭제됨)
         self.params = cv2.aruco.DetectorParameters()
-        
-        # 2. ArucoDetector 객체 생성 (검출 속도 및 최적화 유리)
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.params)
         
         self.bridge = CvBridge()
@@ -33,18 +31,37 @@ class ArucoDetector(Node):
         self.create_subscription(Image, '/front_stereo_camera/left/image_raw', self.image_callback, 10)
         self.create_subscription(CameraInfo, '/front_stereo_camera/left/camera_info', self.info_callback, 10)
         
-        # RMPFlow 타겟 퍼블리셔
-        self.pose_pub = self.create_publisher(PoseStamped, '/rmp_target_pose', 10)
+        # RMPFlow 타겟 퍼블리셔(디버깅용)
+        # self.pose_pub = self.create_publisher(PoseStamped, '/rmp_target_pose', 10)
+        
+        # [On/Off 스위치] 외부에서 True를 보내면 검출 시작
+        self.create_subscription(Bool, '/vision/enable_left', self.enable_callback, 10)
+        
+        # [결과 송신] 직접 제어(/rmp_target_pose) 대신 정보만 제공
+        self.result_pub = self.create_publisher(MarkerArray, '/vision/left_markers', 10)
+        
+        # 상태 변수
+        self.is_enabled = False  # 기본값: 꺼짐
         
         self.camera_matrix = None
         self.dist_coeffs = None
         
-        # 그리퍼가 바닥을 향하는 orientation (원래 코드와 동일)
+        # 그리퍼가 바닥을 향하는 orientation
         euler = np.array([0, np.pi/2, 0])  # roll, pitch, yaw
         rot = Rotation.from_euler('xyz', euler)
         self.default_quat = rot.as_quat()  # [x, y, z, w]
         
-        self.get_logger().info("Ready for ArUco detection.")
+        self.get_logger().info("✅ Front Camera Detector Ready (Waiting for Enable Signal...)")
+        
+    
+    def enable_callback(self, msg):
+        """On/Off 스위치 콜백"""
+        if msg.data and not self.is_enabled:
+            self.get_logger().info("🟢 Detector STARTED")
+            self.is_enabled = True
+        elif not msg.data and self.is_enabled:
+            self.get_logger().info("🔴 Detector STOPPED")
+            self.is_enabled = False
 
     def info_callback(self, msg):
         if self.camera_matrix is None:
@@ -52,24 +69,25 @@ class ArucoDetector(Node):
             self.dist_coeffs = np.array(msg.d)
 
     def image_callback(self, msg):
-        if self.camera_matrix is None: return
+        # 1. 꺼져있거나 카메라 정보가 없으면 패스
+        if not self.is_enabled or self.camera_matrix is None:
+            return
 
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except: return
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # [수정됨] ArucoDetector 객체 사용 (이전 단계에서 수정한 부분 유지)
         corners, ids, rejected = self.detector.detectMarkers(gray)
 
         if ids is not None:
-            # [삭제됨] rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(...) <- 이 함수가 삭제됨
+            # 보낼 메시지 객체 생성
+            marker_array = MarkerArray()
+            marker_array.header.stamp = self.get_clock().now().to_msg()
+            marker_array.header.frame_id = "base_link" # 최종 좌표계 기준
             
-            # [추가됨] 마커 객체 포인트 정의 (3D 좌표계에서 마커의 코너 위치)
-            # 마커 크기의 절반
+            # 3D 좌표 계산을 위한 마커 정의
             marker_half = self.marker_size / 2.0
-            # 마커의 4개 코너 좌표 (좌상단부터 시계방향: top-left, top-right, bottom-right, bottom-left)
             obj_points = np.array([
                 [-marker_half, marker_half, 0],
                 [marker_half, marker_half, 0],
@@ -77,9 +95,10 @@ class ArucoDetector(Node):
                 [-marker_half, -marker_half, 0]
             ], dtype=np.float32)
 
+            # 모든 검출된 마커에 대해 수행
             for i in range(len(ids)):
-                # [수정됨] solvePnP를 사용하여 각 마커의 포즈 계산
-                # corners[i]는 (1, 4, 2) 형태이므로 (4, 2)로 변환 필요
+                current_id = int(ids[i][0])
+                # solvePnP를 사용하여 각 마커의 포즈 계산
                 _, rvec, tvec = cv2.solvePnP(
                     obj_points, 
                     corners[i][0], 
@@ -118,31 +137,37 @@ class ArucoDetector(Node):
                     # 좌표 변환
                     p_robot_pose = tf2_geometry_msgs.do_transform_pose(p_cam.pose, transform)
                     
-                    # 결과 좌표 추출 (로봇 베이스 기준)
+                    info = MarkerInfo()
+                    info.id = int(ids[i][0]) # 마커 ID 저장
+                    
+                    # 물체 집기용 좌표 오프셋 적용
                     robot_x = p_robot_pose.position.x
-                    robot_y = p_robot_pose.position.y + 0.04
-                    robot_z = p_robot_pose.position.z + 0.05
+                    robot_y = p_robot_pose.position.y + 0.04 
+                    robot_z = p_robot_pose.position.z + 0.04
+                    
+                    # Pose 채우기
+                    info.pose.position.x = robot_x
+                    info.pose.position.y = robot_y
+                    info.pose.position.z = robot_z
+                    
+                    # Orientation은 기존 self.default_quat 값 사용
+                    info.pose.orientation.x = self.default_quat[0]
+                    info.pose.orientation.y = self.default_quat[1]
+                    info.pose.orientation.z = self.default_quat[2]
+                    info.pose.orientation.w = self.default_quat[3]
+                    
+                    # 배열에 추가
+                    marker_array.markers.append(info)
 
                     self.get_logger().info(f"ID {ids[i][0]}: Robot Base -> X:{robot_x:.3f}, Y:{robot_y:.3f}, Z:{robot_z:.3f}")
-
-                    # RMPFlow로 전송
-                    target_msg = PoseStamped()
-                    target_msg.header.frame_id = target_frame
-                    target_msg.header.stamp = self.get_clock().now().to_msg()
-                    target_msg.pose.position.x = robot_x
-                    target_msg.pose.position.y = robot_y
-                    target_msg.pose.position.z = robot_z
-                    
-                    target_msg.pose.orientation.x = self.default_quat[0]
-                    target_msg.pose.orientation.y = self.default_quat[1]
-                    target_msg.pose.orientation.z = self.default_quat[2]
-                    target_msg.pose.orientation.w = self.default_quat[3]
-                    
-                    self.pose_pub.publish(target_msg)
 
                 except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
                     continue
 
+            # [추가됨] 루프가 끝난 후 한 번에 전송
+            if len(marker_array.markers) > 0:
+                self.result_pub.publish(marker_array)
+                
         cv2.imshow("Aruco View", frame)
         cv2.waitKey(1)
 

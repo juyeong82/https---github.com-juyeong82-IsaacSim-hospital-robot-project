@@ -13,3 +13,13 @@ icon = "data/icon.png"
 
 [[python.module]]
 name = "rokey_lab_robot"
+
+[dependencies]
+"isaacsim.robot.manipulators" = {}
+"isaacsim.robot_motion.motion_generation" = {}
+"isaacsim.robot_motion.lula" = {}
+"isaacsim.examples.browser" = {}
+"isaacsim.examples.interactive" = {}
+"omni.isaac.ros2_bridge" = {}
+"omni.kit.viewport.utility" = {}
+"isaacsim.sensors.camera" = {}

@@ -27,6 +27,7 @@ setup(
             'nav_commander = my_pkg.nav_commander:main',
             'aruco_detector_front = my_pkg.aruco_detector_front:main',
             'aruco_detector_left = my_pkg.aruco_detector_left:main',
+            'arm_action_server = my_pkg.arm_action_server:main',
         ],
     },
 )

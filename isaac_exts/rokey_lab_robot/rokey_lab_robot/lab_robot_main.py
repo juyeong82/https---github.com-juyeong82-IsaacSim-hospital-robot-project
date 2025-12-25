@@ -11,6 +11,8 @@ import isaacsim.robot_motion.motion_generation as mg
 from pxr import UsdPhysics, Usd, UsdGeom, Gf
 import omni.kit.viewport.utility as vp_util
 
+from std_msgs.msg import Float64MultiArray
+
 # ---------------------------------------------------------------------------
 # RMPFlow Controller
 # ---------------------------------------------------------------------------
@@ -166,6 +168,20 @@ class LabRobotMain(BaseSample):
             10
         )
         
+        # 3. 조인트 직접 제어 명령 수신 (추가됨)
+        self.sub_joints = self.node.create_subscription(
+            Float64MultiArray,
+            "/joint_command",
+            self.ros_joint_callback,
+            10
+        )
+        
+        # 제어 모드 변수 (기본값: pose)
+        # pose: RMPFlow를 이용한 좌표 제어
+        # joint: 각도 직접 제어
+        self.control_mode = "pose" 
+        self.target_joint_positions = None
+        
         print("📡 [ROS 2] Waiting for commands...")
         print("   - Pose: /rmp_target_pose (geometry_msgs/PoseStamped)")
         print("   - Gripper: /gripper_command (std_msgs/String) -> 'open' or 'close'")
@@ -218,6 +234,7 @@ class LabRobotMain(BaseSample):
 
     # [Callback 1] 좌표 수신
     def ros_pose_callback(self, msg):
+        self.control_mode = "pose"
         x, y, z = msg.pose.position.x, msg.pose.position.y, msg.pose.position.z
         self.current_target_pos = np.array([x, y, z])
 
@@ -239,6 +256,13 @@ class LabRobotMain(BaseSample):
             print("✊ [Gripper] CLOSE Request")
         else:
             print(f"⚠️ Unknown command: {command} (Use 'open' or 'close')")
+            
+    def ros_joint_callback(self, msg):
+        # 메시지가 오면 제어 모드를 joint로 변경
+        self.control_mode = "joint"
+        # 들어온 리스트를 numpy 배열로 변환
+        self.target_joint_positions = np.array(msg.data)
+        print(f"🦾 [Joint Control] Mode Switched. Target: {self.target_joint_positions}")
 
     def physics_step(self, step_size):
         # rclpy가 import 되지 않았을 경우 방어 코드
@@ -261,14 +285,24 @@ class LabRobotMain(BaseSample):
             print(f"🎯 Target: {self.current_target_pos} | 🤖 Current EE: {ee_pos}")
 
         # 로봇 제어 (RMPFlow)
-        rmp_action = self.cspace_controller.forward(
-            target_end_effector_position=self.current_target_pos,
-            target_end_effector_orientation=self.current_target_rot
-        )
+        if self.control_mode == "pose":
+            # 기존 RMPFlow 제어 (좌표 이동)
+            rmp_action = self.cspace_controller.forward(
+                target_end_effector_position=self.current_target_pos,
+                target_end_effector_orientation=self.current_target_rot
+            )
+            full_action = ArticulationAction(
+                joint_positions=rmp_action.joint_positions,
+                joint_velocities=rmp_action.joint_velocities,
+                joint_indices=np.array(self.arm_indices)
+            )
+            self.robots.apply_action(full_action)
         
-        full_action = ArticulationAction(
-            joint_positions=rmp_action.joint_positions,
-            joint_velocities=rmp_action.joint_velocities,
-            joint_indices=np.array(self.arm_indices)
-        )
-        self.robots.apply_action(full_action)
+        elif self.control_mode == "joint" and self.target_joint_positions is not None:
+            # 새로 추가된 조인트 직접 제어
+            # RMPFlow를 거치지 않고 바로 관절 명령 전달
+            joint_action = ArticulationAction(
+                joint_positions=self.target_joint_positions,
+                joint_indices=np.array(self.arm_indices)
+            )
+            self.robots.apply_action(joint_action)

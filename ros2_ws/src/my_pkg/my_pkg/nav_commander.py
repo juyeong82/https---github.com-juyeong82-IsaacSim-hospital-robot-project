@@ -16,9 +16,13 @@ class NavCommander(Node):
         init_pose = PoseStamped()
         init_pose.header.frame_id = 'map'
         init_pose.header.stamp = self.nav.get_clock().now().to_msg()
-        init_pose.pose.position.x = 0.0
-        init_pose.pose.position.y = 0.0
-        init_pose.pose.orientation.w = 1.0 
+        init_pose.pose.position.x = 25.6
+        init_pose.pose.position.y = 8.4
+        init_pose.pose.position.z = 0.0
+        init_pose.pose.orientation.x = 0.0
+        init_pose.pose.orientation.y = 0.0
+        init_pose.pose.orientation.z = 1.0  # sin(3.14/2) ≈ 1.0
+        init_pose.pose.orientation.w = 0.0  # cos(3.14/2) ≈ 0.0
         
         # Nav2 활성화 대기
         self.nav.setInitialPose(init_pose)
