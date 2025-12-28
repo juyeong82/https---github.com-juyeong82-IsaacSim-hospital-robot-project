@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'nav_commander = my_pkg.nav_commander:main',
+            'visual_servoing = my_pkg.visual_servoing:main',
             'aruco_detector = my_pkg.aruco_detector:main',
             'aruco_detector_front = my_pkg.aruco_detector_front:main',
             'aruco_detector_debug = my_pkg.aruco_detector_debug:main',
