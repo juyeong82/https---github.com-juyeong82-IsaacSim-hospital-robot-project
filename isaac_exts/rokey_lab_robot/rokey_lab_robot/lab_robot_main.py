@@ -267,7 +267,9 @@ class LabRobotMain(BaseSample):
 
         full_dof = self.robots.num_dof
         initial_pos = np.zeros(full_dof)
-        arm_home = np.array([0, -np.pi/2, -np.pi/2, -np.pi/2, np.pi/2, 0])
+        # arm_home = np.array([0, -np.pi/2, -np.pi/2, -np.pi/2, np.pi/2, 0])
+        # gripper_camera가 left_camera와 동일한 화각을 가지는 관측 자세
+        arm_home = np.array([0.1745, -1.4835, -2.4435, -0.7854, 1.5708, 1.75])
         for i, idx in enumerate(self.arm_indices):
             initial_pos[idx] = arm_home[i]
         self.robots.set_joint_positions(initial_pos)

@@ -32,17 +32,17 @@ class ArucoDetector(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # 카메라 구독
-        self.create_subscription(Image, '/left_camera/rgb', self.image_callback, 10)
-        self.create_subscription(CameraInfo, '/left_camera/camera_info', self.info_callback, 10)
+        self.create_subscription(Image, '/gripper_camera/rgb', self.image_callback, 10)
+        self.create_subscription(CameraInfo, '/gripper_camera/camera_info', self.info_callback, 10)
         
         # RMPFlow 타겟 퍼블리셔(디버깅용)
         # self.pose_pub = self.create_publisher(PoseStamped, '/rmp_target_pose', 10)
         
         # [On/Off 스위치] 외부에서 True를 보내면 검출 시작
-        self.create_subscription(Bool, '/vision/enable_left', self.enable_callback, 10)
+        self.create_subscription(Bool, '/vision/enable_gripper', self.enable_callback, 10)
         
         # [결과 송신] 직접 제어(/rmp_target_pose) 대신 정보만 제공
-        self.result_pub = self.create_publisher(MarkerArray, '/vision/left_markers', 10)
+        self.result_pub = self.create_publisher(MarkerArray, '/vision/gripper_markers', 10)
         
         # 상태 변수
         self.is_enabled = False  # 기본값: 꺼짐
@@ -143,7 +143,7 @@ class ArucoDetector(Node):
                     
                     # UR10 베이스 프레임 변환 준비
                     target_frame = "base_link"
-                    source_frame = "left_Camera" # TF 트리에 등록된 정확한 카메라 프레임 이름 확인 필요
+                    source_frame = "gripper_Camera" # TF 트리에 등록된 정확한 카메라 프레임 이름 확인 필요
                     
                     # PoseStamped 설정 (위에서 계산한 T_cam_target 사용)
                     p_cam = PoseStamped()
