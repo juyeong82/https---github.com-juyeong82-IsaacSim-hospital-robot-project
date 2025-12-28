@@ -24,10 +24,22 @@ class ArucoDetector(Node):
         # TF 리스너
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        
+        # gripper
+        self.create_subscription(Image, '/gripper_camera/rgb', self.image_callback, 10)
+        self.create_subscription(CameraInfo, '/gripper_camera/camera_info', self.info_callback, 10)
 
-        # 카메라 구독 (Right Camera)
-        self.create_subscription(Image, '/right_camera/rgb', self.image_callback, 10)
-        self.create_subscription(CameraInfo, '/right_camera/camera_info', self.info_callback, 10)
+        # Right Camera
+        # self.create_subscription(Image, '/right_camera/rgb', self.image_callback, 10)
+        # self.create_subscription(CameraInfo, '/right_camera/camera_info', self.info_callback, 10)
+        
+        # left
+        # self.create_subscription(Image, '/left_camera/rgb', self.image_callback, 10)
+        # self.create_subscription(CameraInfo, '/left_camera/camera_info', self.info_callback, 10)
+        
+        # front
+        # self.create_subscription(Image, '/front_camera/rgb', self.image_callback, 10)
+        # self.create_subscription(CameraInfo, '/front_camera/camera_info', self.info_callback, 10)
         
         # RMPFlow 타겟 퍼블리셔
         self.pose_pub = self.create_publisher(PoseStamped, '/rmp_target_pose', 10)
@@ -95,10 +107,8 @@ class ArucoDetector(Node):
                     T_offset = np.eye(4)
                     
                     # [튜닝 포인트] 
-                    # offset_y: -0.04 (마커 기준 위쪽으로 이동)
-                    # offset_z: -0.02 (마커 기준 뒤쪽/안쪽으로 이동)
                     T_offset[0, 3] = 0.0      # X (좌우)
-                    T_offset[1, 3] = 0.05    # Y (위아래, 위가 -)
+                    T_offset[1, 3] = 0.03    # Y (위아래, 위가 -)
                     T_offset[2, 3] = -0.04    # Z (앞뒤, 뒤가 -)
                     
                     # 4. 최종 목표 위치 계산 (행렬 곱)
@@ -107,9 +117,12 @@ class ArucoDetector(Node):
                     # =========================================================
 
                     # PoseStamped 설정
-                    # source_frame = "front_stereo_camera_left_rgb"
-                    source_frame = "right_Camera" # 사용중인 카메라 프레임
+                    source_frame = "gripper_Camera" # 사용중인 카메라 프레임
+                    # source_frame = "right_Camera" # 사용중인 카메라 프레임
                     target_frame = "base_link"
+                    # source_frame = "left_Camera"
+                    # source_frame = "Camera"
+                    
                     
                     p_cam = PoseStamped()
                     p_cam.header.frame_id = source_frame

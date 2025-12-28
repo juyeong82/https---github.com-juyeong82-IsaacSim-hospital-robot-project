@@ -115,22 +115,47 @@ class ArucoDetector(Node):
                 cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, rvec, tvec, 0.1)
 
                 try:
-                    # UR10 베이스 프레임 (RMPFlow가 사용하는 좌표계)
-                    target_frame = "base_link"
-                    source_frame = "Camera"
+                    # =========================================================
+                    # [수정] 로컬 오프셋 적용 (Matrix 연산)
+                    # =========================================================
                     
-                    # PoseStamped 설정 (카메라 좌표계)
+                    # 1. 회전 벡터(rvec) -> 3x3 회전 행렬(R) 변환
+                    R, _ = cv2.Rodrigues(rvec)
+                    
+                    # 2. 카메라 기준 마커의 변환 행렬 (4x4)
+                    T_cam_marker = np.eye(4)
+                    T_cam_marker[:3, :3] = R
+                    T_cam_marker[:3, 3] = tvec.squeeze()
+                    
+                    # 3. 마커 기준 오프셋 행렬 (Local Offset)
+                    T_offset = np.eye(4)
+                    
+                    # [튜닝 포인트] Front 카메라도 동일한 마커를 보므로 오프셋 값은 동일합니다
+                    T_offset[0, 3] = 0.0      # X (좌우)
+                    T_offset[1, 3] = 0.03    # Y (위아래, 위가 -)
+                    T_offset[2, 3] = -0.04    # Z (앞뒤, 뒤가 -)
+                    
+                    # 4. 최종 목표 위치 계산
+                    T_cam_target = T_cam_marker @ T_offset
+                    
+                    # =========================================================
+
+                    # UR10 베이스 프레임
+                    target_frame = "base_link"
+                    source_frame = "Camera" # Front 카메라는 보통 'Camera' 혹은 'front_camera' 프레임 사용 (기존 코드 유지)
+                    
+                    # PoseStamped 설정
                     p_cam = PoseStamped()
                     p_cam.header.frame_id = source_frame
                     p_cam.header.stamp = msg.header.stamp
                     
-                    # tvec은 (3, 1) 형태이므로 인덱싱 주의
-                    p_cam.pose.position.x = float(tvec[0][0])
-                    p_cam.pose.position.y = float(tvec[1][0])
-                    p_cam.pose.position.z = float(tvec[2][0])
+                    # 위치 추출
+                    p_cam.pose.position.x = T_cam_target[0, 3]
+                    p_cam.pose.position.y = T_cam_target[1, 3]
+                    p_cam.pose.position.z = T_cam_target[2, 3]
                     p_cam.pose.orientation.w = 1.0
 
-                    # TF 변환: 카메라 -> UR10 베이스
+                    # TF 변환
                     transform = self.tf_buffer.lookup_transform(
                         target_frame,
                         source_frame,
@@ -142,28 +167,22 @@ class ArucoDetector(Node):
                     p_robot_pose = tf2_geometry_msgs.do_transform_pose(p_cam.pose, transform)
                     
                     info = MarkerInfo()
-                    info.id = int(ids[i][0]) # 마커 ID 저장
+                    info.id = int(ids[i][0])
                     
-                    # 물체 집기용 좌표 오프셋 적용
-                    robot_x = p_robot_pose.position.x + 0.04
-                    robot_y = p_robot_pose.position.y 
-                    robot_z = p_robot_pose.position.z + 0.03
+                    # 변환된 좌표 그대로 사용
+                    info.pose.position.x = p_robot_pose.position.x
+                    info.pose.position.y = p_robot_pose.position.y
+                    info.pose.position.z = p_robot_pose.position.z
                     
-                    # Pose 채우기
-                    info.pose.position.x = robot_x
-                    info.pose.position.y = robot_y
-                    info.pose.position.z = robot_z
-                    
-                    # Orientation은 기존 self.default_quat 값 사용
+                    # Orientation
                     info.pose.orientation.x = self.default_quat[0]
                     info.pose.orientation.y = self.default_quat[1]
                     info.pose.orientation.z = self.default_quat[2]
                     info.pose.orientation.w = self.default_quat[3]
                     
-                    # 배열에 추가
                     marker_array.markers.append(info)
 
-                    self.get_logger().info(f"ID {ids[i][0]}: Robot Base -> X:{robot_x:.3f}, Y:{robot_y:.3f}, Z:{robot_z:.3f}")
+                    self.get_logger().info(f"ID {ids[i][0]}: Robot Base -> X:{p_robot_pose.position.x:.3f}, Y:{p_robot_pose.position.y:.3f}, Z:{p_robot_pose.position.z:.3f}")
 
                 except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
                     continue
