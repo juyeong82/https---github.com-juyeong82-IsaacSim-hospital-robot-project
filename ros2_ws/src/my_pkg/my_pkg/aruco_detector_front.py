@@ -10,6 +10,8 @@ from moma_interfaces.msg import MarkerArray, MarkerInfo
 import tf2_geometry_msgs
 from scipy.spatial.transform import Rotation
 from std_msgs.msg import Bool
+import math
+from collections import deque
 
 class ArucoDetector(Node):
     def __init__(self):
@@ -35,9 +37,6 @@ class ArucoDetector(Node):
         self.create_subscription(Image, '/front_camera/rgb', self.image_callback, 10)
         self.create_subscription(CameraInfo, '/front_camera/camera_info', self.info_callback, 10)
         
-        # RMPFlow 타겟 퍼블리셔(디버깅용)
-        # self.pose_pub = self.create_publisher(PoseStamped, '/rmp_target_pose', 10)
-        
         # [On/Off 스위치] 외부에서 True를 보내면 검출 시작
         self.create_subscription(Bool, '/vision/enable_front', self.enable_callback, 10)
         
@@ -50,12 +49,26 @@ class ArucoDetector(Node):
         self.camera_matrix = None
         self.dist_coeffs = None
         
+        # =========================================================
+        # [추가] Yaw 오프셋 설정
+        # =========================================================
+        self.yaw_offset = 90.0  # -90°를 0°로 만들기 위한 오프셋
+        # =========================================================
+        
+        # =========================================================
+        # [추가] 스무딩 필터 (이동 평균)
+        # =========================================================
+        self.marker_history = {}  # {marker_id: deque of (x, y, z, yaw)}
+        self.history_size = 5     # 최근 5프레임 평균
+        # =========================================================
+        
         # 그리퍼가 바닥을 향하는 orientation (원래 코드와 동일)
         euler = np.array([0, np.pi/2, 0])  # roll, pitch, yaw
         rot = Rotation.from_euler('xyz', euler)
         self.default_quat = rot.as_quat()  # [x, y, z, w]
         
-        self.get_logger().info("✅ Front Camera Detector Ready (Waiting for Enable Signal...)")
+        self.get_logger().info("✅ Front Camera Detector Ready (with Smoothing)")
+        self.get_logger().info(f"🔧 Yaw Offset: {self.yaw_offset}° | History Size: {self.history_size}")
         
     
     def enable_callback(self, msg):
@@ -71,6 +84,36 @@ class ArucoDetector(Node):
         if self.camera_matrix is None:
             self.camera_matrix = np.array(msg.k).reshape((3, 3))
             self.dist_coeffs = np.array(msg.d)
+
+    def smooth_pose(self, marker_id, x, y, z, yaw):
+        """위치 및 각도 스무딩"""
+        if marker_id not in self.marker_history:
+            self.marker_history[marker_id] = deque(maxlen=self.history_size)
+        
+        self.marker_history[marker_id].append((x, y, z, yaw))
+        
+        # 평균 계산
+        history = list(self.marker_history[marker_id])
+        avg_x = sum(h[0] for h in history) / len(history)
+        avg_y = sum(h[1] for h in history) / len(history)
+        avg_z = sum(h[2] for h in history) / len(history)
+        
+        # Yaw 각도 discontinuity 처리
+        yaws = [h[3] for h in history]
+        normalized_yaws = [yaws[0]]
+        for y in yaws[1:]:
+            diff = y - yaws[0]
+            while diff > 180: diff -= 360
+            while diff < -180: diff += 360
+            normalized_yaws.append(yaws[0] + diff)
+        
+        avg_yaw = sum(normalized_yaws) / len(normalized_yaws)
+        
+        # -180~180 정규화
+        while avg_yaw > 180: avg_yaw -= 360
+        while avg_yaw < -180: avg_yaw += 360
+        
+        return avg_x, avg_y, avg_z, avg_yaw
 
     def image_callback(self, msg):
         # 1. 꺼져있거나 카메라 정보가 없으면 패스
@@ -110,52 +153,49 @@ class ArucoDetector(Node):
                     self.dist_coeffs
                 )
 
-                # 시각화 처리 (차원 문제로 인해 rvec, tvec 형태 주의)
+                # 시각화 처리
                 cv2.aruco.drawDetectedMarkers(frame, corners, ids)
                 cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, rvec, tvec, 0.1)
 
                 try:
-                    # =========================================================
-                    # [수정] 로컬 오프셋 적용 (Matrix 연산)
-                    # =========================================================
+                    target_frame = "base_link"
+                    source_frame = "Camera"
+
+                    # 회전 벡터 -> 회전 행렬
+                    R_mat, _ = cv2.Rodrigues(rvec)
                     
-                    # 1. 회전 벡터(rvec) -> 3x3 회전 행렬(R) 변환
-                    R, _ = cv2.Rodrigues(rvec)
-                    
-                    # 2. 카메라 기준 마커의 변환 행렬 (4x4)
+                    # 카메라 기준 마커 변환 행렬
                     T_cam_marker = np.eye(4)
-                    T_cam_marker[:3, :3] = R
+                    T_cam_marker[:3, :3] = R_mat
                     T_cam_marker[:3, 3] = tvec.squeeze()
                     
-                    # 3. 마커 기준 오프셋 행렬 (Local Offset)
+                    # 오프셋 (필요시 조정)
                     T_offset = np.eye(4)
+                    T_offset[0, 3] = 0.0
+                    T_offset[1, 3] = 0.0
+                    T_offset[2, 3] = 0.0
                     
-                    # 아루코 마커 기준 그립을 위한 에셋상단 위치 
-                    T_offset[0, 3] = 0.0      # X (좌우)
-                    T_offset[1, 3] = 0.03    # Y (위아래, 위가 +)
-                    T_offset[2, 3] = -0.04    # Z (앞뒤, 뒤가 -)
-                    
-                    # 4. 최종 목표 위치 계산
                     T_cam_target = T_cam_marker @ T_offset
                     
-                    # =========================================================
+                    # 회전 행렬 -> Quaternion
+                    rot_target = Rotation.from_matrix(T_cam_target[:3, :3])
+                    quat_target = rot_target.as_quat()
 
-                    # UR10 베이스 프레임
-                    target_frame = "base_link"
-                    source_frame = "Camera" # Front 카메라는 보통 'Camera' 혹은 'front_camera' 프레임 사용 (기존 코드 유지)
-                    
                     # PoseStamped 설정
                     p_cam = PoseStamped()
                     p_cam.header.frame_id = source_frame
                     p_cam.header.stamp = msg.header.stamp
                     
-                    # 위치 추출
                     p_cam.pose.position.x = T_cam_target[0, 3]
                     p_cam.pose.position.y = T_cam_target[1, 3]
                     p_cam.pose.position.z = T_cam_target[2, 3]
-                    p_cam.pose.orientation.w = 1.0
+                    
+                    p_cam.pose.orientation.x = quat_target[0]
+                    p_cam.pose.orientation.y = quat_target[1]
+                    p_cam.pose.orientation.z = quat_target[2]
+                    p_cam.pose.orientation.w = quat_target[3]
 
-                    # TF 변환
+                    # TF 변환 (Camera -> Base Link)
                     transform = self.tf_buffer.lookup_transform(
                         target_frame,
                         source_frame,
@@ -163,31 +203,71 @@ class ArucoDetector(Node):
                         timeout=rclpy.duration.Duration(seconds=0.1)
                     )
                     
-                    # 좌표 변환
                     p_robot_pose = tf2_geometry_msgs.do_transform_pose(p_cam.pose, transform)
                     
+                    # Raw Yaw 계산
+                    q = p_robot_pose.orientation
+                    rot_base = Rotation.from_quat([q.x, q.y, q.z, q.w])
+                    raw_yaw_deg = rot_base.as_euler('xyz', degrees=True)[2]
+                    
+                    # 오프셋 적용
+                    corrected_yaw_deg = raw_yaw_deg + self.yaw_offset
+                    
+                    # -180 ~ 180 정규화
+                    while corrected_yaw_deg > 180:
+                        corrected_yaw_deg -= 360
+                    while corrected_yaw_deg < -180:
+                        corrected_yaw_deg += 360
+                    
+                    # =========================================================
+                    # [추가] 스무딩 적용
+                    # =========================================================
+                    raw_x = p_robot_pose.position.x
+                    raw_y = p_robot_pose.position.y
+                    raw_z = p_robot_pose.position.z
+                    
+                    smooth_x, smooth_y, smooth_z, smooth_yaw = self.smooth_pose(
+                        current_id, raw_x, raw_y, raw_z, corrected_yaw_deg
+                    )
+                    # =========================================================
+                    
+                    # 거리 계산
+                    dist = math.sqrt(smooth_x**2 + smooth_y**2 + smooth_z**2)
+                    
+                    # 화면 표시 (스무딩된 값)
+                    text = f"ID:{current_id} Dist:{dist:.2f}m Yaw:{smooth_yaw:.1f}deg"
+                    cv2.putText(frame, text, (10, 30 + i*30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    # 콘솔 로그 (첫 번째 마커만)
+                    if i == 0:
+                        print(f"👁️ [ArUco] ID:{current_id} | "
+                              f"X:{smooth_x:.2f}, Y:{smooth_y:.2f}, Z:{smooth_z:.2f} | "
+                              f"Yaw:{smooth_yaw:.1f}°")
+                    
+                    # 스무딩된 Yaw -> Quaternion
+                    corrected_rot = Rotation.from_euler('xyz', [0, 0, math.radians(smooth_yaw)])
+                    corrected_quat = corrected_rot.as_quat()
+                    
                     info = MarkerInfo()
-                    info.id = int(ids[i][0])
+                    info.id = current_id
                     
-                    # 변환된 좌표 그대로 사용
-                    info.pose.position.x = p_robot_pose.position.x
-                    info.pose.position.y = p_robot_pose.position.y
-                    info.pose.position.z = p_robot_pose.position.z
+                    # 스무딩된 위치
+                    info.pose.position.x = smooth_x
+                    info.pose.position.y = smooth_y
+                    info.pose.position.z = smooth_z
                     
-                    # Orientation
-                    info.pose.orientation.x = self.default_quat[0]
-                    info.pose.orientation.y = self.default_quat[1]
-                    info.pose.orientation.z = self.default_quat[2]
-                    info.pose.orientation.w = self.default_quat[3]
+                    # 스무딩된 회전
+                    info.pose.orientation.x = corrected_quat[0]
+                    info.pose.orientation.y = corrected_quat[1]
+                    info.pose.orientation.z = corrected_quat[2]
+                    info.pose.orientation.w = corrected_quat[3]
                     
                     marker_array.markers.append(info)
-
-                    self.get_logger().info(f"ID {ids[i][0]}: Robot Base -> X:{p_robot_pose.position.x:.3f}, Y:{p_robot_pose.position.y:.3f}, Z:{p_robot_pose.position.z:.3f}")
 
                 except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
                     continue
 
-            # [추가됨] 루프가 끝난 후 한 번에 전송
             if len(marker_array.markers) > 0:
                 self.result_pub.publish(marker_array)
                 

@@ -2,154 +2,312 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from moma_interfaces.msg import MarkerArray
-from std_msgs.msg import Bool
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
 import math
-import time
 
-class VisualServoBase(Node):
+STATE_APPROACH = 0
+STATE_ALIGN_YAW = 1
+STATE_VERIFY = 2
+STATE_SEARCH = 3
+
+class SimplifiedDockingNode(Node):
     def __init__(self):
-        super().__init__('visual_servo_base')
-
-        # ---------------------------------------------------------
-        # 1. 제어 파라미터 (튜닝)
-        # ---------------------------------------------------------
-        self.target_dist = 1.0  # 목표 거리 (m)
-        self.dist_tolerance = 0.02 # 거리 허용 오차 (m)
-        self.angle_tolerance = 0.02 # 각도 허용 오차 (rad)
+        super().__init__('simplified_docking_node')
         
-        # PID 게인
-        self.k_v = 0.5  # 속도 게인
-        self.k_w = 0.8  # 회전 게인 (반응성을 위해 약간 낮춤)
+        # ========================================
+        # 설정
+        # ========================================
+        self.target_distance = 2.0
         
-        # 속도 제한
-        self.max_v = 0.15 
-        self.max_w = 0.3
-
-        # 안전 장치: 데이터가 이 시간보다 오래되면 정지
-        self.watchdog_timeout = 0.5 # 초
-
-        # ---------------------------------------------------------
-        # 2. 통신
-        # ---------------------------------------------------------
+        # 허용 오차
+        self.tolerance_lateral = 0.15
+        self.tolerance_dist = 0.08
+        self.tolerance_yaw = 8.0
+        
+        # 제어 게인
+        self.k_lateral = 1.5
+        self.k_yaw = 0.8
+        self.k_linear = 0.5
+        
+        self.max_angular = 0.6
+        self.max_linear = 0.3
+        
+        # 진동 감지용
+        self.yaw_history = []
+        self.history_size = 10
+        
+        # ========================================
+        # [추가] 마커 소실 복구용
+        # ========================================
+        self.last_angular_vel = 0.0   # 마지막 회전 속도
+        self.lost_from_state = None   # 어느 상태에서 놓쳤는지
+        # ========================================
+        
+        self.bridge = CvBridge()
+        
+        # Subscribe
         self.sub_markers = self.create_subscription(
             MarkerArray, '/vision/front_markers', self.marker_callback, 10
         )
-        self.sub_enable = self.create_subscription(
-            Bool, '/visual_servo/enable', self.enable_callback, 10
+        self.sub_image = self.create_subscription(
+            Image, '/front_camera/rgb', self.image_callback, 10
         )
-        self.pub_vel = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.pub_result = self.create_publisher(Bool, '/visual_servo/done', 10)
-
-        # ---------------------------------------------------------
-        # 3. 상태 관리 (Timer 루프 방식)
-        # ---------------------------------------------------------
-        # 마커가 안 와도 주기적으로 판단하기 위해 타이머 사용
-        self.create_timer(0.1, self.control_loop) 
-
-        self.is_enabled = False
-        self.last_marker_time = 0.0
-        self.latest_marker = None
         
-        self.get_logger().info("✅ Visual Servo V2 Ready (Watchdog & Log Added)")
-
-    def enable_callback(self, msg):
-        if msg.data:
-            self.is_enabled = True
-            self.get_logger().info("🟢 [START] Visual Servoing Enabled")
-        else:
-            self.is_enabled = False
-            self.stop_robot()
-            self.get_logger().info("🔴 [STOP] Visual Servoing Disabled")
+        # Publish
+        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
+        
+        # 상태
+        self.marker_data = None
+        self.last_marker_time = self.get_clock().now()
+        
+        self.state = STATE_APPROACH
+        self.docking_active = False
+        
+        self.timer = self.create_timer(0.05, self.control_loop)
+        
+        print("✅ Simplified Docking Started (Smart Recovery)")
+        print(f"🎯 Tolerances: Lat={self.tolerance_lateral}m, Dist={self.tolerance_dist}m, Yaw={self.tolerance_yaw}°")
 
     def marker_callback(self, msg):
-        """데이터 수신 및 타임스탬프 갱신"""
-        if len(msg.markers) > 0:
-            self.latest_marker = msg.markers[0]
-            self.last_marker_time = time.time()
+        """마커 데이터 (base_link 기준)"""
+        if len(msg.markers) == 0:
+            self.marker_data = None
+            return
+        
+        marker = msg.markers[0]
+        
+        # base_link 기준 마커 좌표
+        x = marker.pose.position.x
+        y = marker.pose.position.y
+        
+        # Yaw 추출
+        from scipy.spatial.transform import Rotation as R
+        q = marker.pose.orientation
+        rot = R.from_quat([q.x, q.y, q.z, q.w])
+        yaw = rot.as_euler('xyz', degrees=True)[2]
+        
+        self.marker_data = (x, y, yaw)
+        self.last_marker_time = self.get_clock().now()
+
+    def image_callback(self, msg):
+        """디버깅용 시각화"""
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except:
+            return
+        
+        state_text = ["APPROACH", "ALIGN_YAW", "VERIFY", "SEARCH"][self.state]
+        
+        if self.marker_data:
+            x, y, yaw = self.marker_data
+            
+            # 오차 계산
+            lateral_error, dist_error, yaw_error_deg = self.calculate_errors()
+            
+            if lateral_error is not None:
+                text = f"{state_text} | Lat:{lateral_error:+.2f}m | Dist:{dist_error:+.2f}m | Yaw:{yaw_error_deg:+.1f}deg"
+                cv2.putText(frame, text, (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                
+                text2 = f"Marker (base_link): X={x:.2f}m Y={y:.2f}m Yaw={yaw:.1f}deg"
+                cv2.putText(frame, text2, (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                
+                # 마지막 회전 방향 표시
+                text3 = f"Last AngVel: {self.last_angular_vel:+.2f} rad/s"
+                cv2.putText(frame, text3, (10, 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        else:
+            text = f"{state_text} | Waiting for marker..."
+            cv2.putText(frame, text, (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        cv2.imshow("Simplified Docking", frame)
+        cv2.waitKey(1)
+
+    def calculate_errors(self):
+        """base_link 기준 오차 계산"""
+        if self.marker_data is None:
+            return None, None, None
+        
+        x, y, yaw_deg = self.marker_data
+        
+        lateral_error = y
+        dist_error = x - self.target_distance
+        yaw_error_deg = yaw_deg
+        
+        return lateral_error, dist_error, yaw_error_deg
+
+    def check_oscillation(self, yaw_error):
+        """진동 감지"""
+        self.yaw_history.append(yaw_error)
+        if len(self.yaw_history) > self.history_size:
+            self.yaw_history.pop(0)
+        
+        if len(self.yaw_history) < self.history_size:
+            return False
+        
+        # 부호가 계속 바뀌면 진동
+        sign_changes = 0
+        for i in range(1, len(self.yaw_history)):
+            if (self.yaw_history[i] * self.yaw_history[i-1]) < 0:
+                sign_changes += 1
+        
+        return sign_changes >= 5
 
     def control_loop(self):
-        """0.1초마다 실행되는 메인 제어 루프"""
-        if not self.is_enabled:
-            return
-
-        # 1. Watchdog: 데이터가 끊겼는지 확인
-        time_diff = time.time() - self.last_marker_time
+        # ========================================
+        # 마커 소실 처리
+        # ========================================
+        time_since_marker = (self.get_clock().now() - self.last_marker_time).nanoseconds / 1e9
         
-        if time_diff > self.watchdog_timeout:
-            # [중요] 마커를 놓치면 즉시 정지
-            self.get_logger().warn(f"⚠️ Marker Lost! (Last seen {time_diff:.1f}s ago) -> STOPPING")
-            self.stop_robot()
+        if time_since_marker > 0.5:
+            if self.state != STATE_SEARCH:
+                # 어느 상태에서 놓쳤는지 기억
+                self.lost_from_state = self.state
+                print(f"⚠️ Marker Lost from {['APPROACH', 'ALIGN_YAW', 'VERIFY'][self.lost_from_state]}")
+                print(f"   Last angular velocity: {self.last_angular_vel:+.2f} rad/s")
+                self.state = STATE_SEARCH
+            
+            cmd = Twist()
+            
+            # ========================================
+            # [핵심] 마지막 회전 방향의 반대로 회전
+            # ========================================
+            if abs(self.last_angular_vel) > 0.01:
+                # 마지막 회전 속도가 있으면 반대로
+                search_direction = -1.0 * math.copysign(1, self.last_angular_vel)
+                cmd.angular.z = 0.5 * search_direction
+                print(f"🔍 Reversing rotation: {cmd.angular.z:+.2f} rad/s (was {self.last_angular_vel:+.2f})")
+            else:
+                # 회전 없었으면 기본 회전
+                cmd.angular.z = 0.4
+                print(f"🔍 Default search rotation: {cmd.angular.z:+.2f} rad/s")
+            
+            self.pub_cmd.publish(cmd)
             return
-
-        # 2. 제어 로직 수행
-        if self.latest_marker:
-            self.process_servoing(self.latest_marker)
-
-    def process_servoing(self, marker):
-        # 좌표 추출 (Base Link 기준)
-        # x: 전방 거리, y: 좌우 편차
-        curr_x = marker.pose.position.x
-        curr_y = marker.pose.position.y
+        
+        # 마커 재발견
+        if self.state == STATE_SEARCH:
+            print("👀 Marker Regained!")
+            # 놓친 상태로 복귀
+            if self.lost_from_state is not None:
+                self.state = self.lost_from_state
+                print(f"   Resuming {['APPROACH', 'ALIGN_YAW', 'VERIFY'][self.state]}")
+            else:
+                self.state = STATE_APPROACH
+            self.lost_from_state = None
+        
+        if self.marker_data is None:
+            self.pub_cmd.publish(Twist())
+            return
         
         # 오차 계산
-        error_dist = curr_x - self.target_dist
-        error_angle = math.atan2(curr_y, curr_x)
-
-        # --- 로그 출력 (상태 모니터링) ---
-        # 현재 거리, 각도, 오차를 한눈에 보이게 출력
-        log_msg = (
-            f"👀 Marker at X:{curr_x:.3f}m | "
-            f"Err_Dist: {error_dist:.3f}m | "
-            f"Err_Ang: {error_angle:.3f}rad"
-        )
-        # -------------------------------
-
-        # 완료 조건 확인
-        if abs(error_dist) < self.dist_tolerance and abs(error_angle) < self.angle_tolerance:
-            self.get_logger().info(f"✅ Success! Reached Target. ({log_msg})")
-            self.stop_robot()
-            self.pub_result.publish(Bool(data=True))
-            self.is_enabled = False # 작업 종료
+        lateral_error, dist_error, yaw_error_deg = self.calculate_errors()
+        
+        if lateral_error is None:
+            self.pub_cmd.publish(Twist())
             return
-
-        # P 제어 계산
-        v_cmd = self.k_v * error_dist
-        w_cmd = self.k_w * error_angle
-
-        # 속도 제한 (Clamping)
-        v_cmd = max(min(v_cmd, self.max_v), -self.max_v)
-        w_cmd = max(min(w_cmd, self.max_w), -self.max_w)
         
-        # [특수 조건] 각도가 너무 틀어졌으면 제자리 회전만 수행
-        if abs(error_angle) > 0.15: # 약 8.5도
-            v_cmd = 0.0
-            log_msg += " [Rotating First]"
+        if not self.docking_active:
+            print("🎯 Docking Started")
+            self.docking_active = True
         
-        # [특수 조건] 너무 가까우면(30cm 이내) 후진 허용하되 천천히
-        if curr_x < 0.3:
-            log_msg += " [Too Close! Backing up]"
-            # 후진은 그대로 v_cmd가 음수가 되므로 자동 처리됨
-
-        self.get_logger().info(log_msg) # 로그 출력
-
-        # 명령 전송
         cmd = Twist()
-        cmd.linear.x = v_cmd
-        cmd.angular.z = w_cmd
-        self.pub_vel.publish(cmd)
-
-    def stop_robot(self):
-        cmd = Twist() # 0,0,0
-        self.pub_vel.publish(cmd)
+        
+        # ========================================
+        # 상태 머신
+        # ========================================
+        
+        if self.state == STATE_APPROACH:
+            # 1단계: 좌우 + 거리
+            if abs(lateral_error) < self.tolerance_lateral and abs(dist_error) < self.tolerance_dist:
+                print(f"✅ Position OK! Aligning Yaw...")
+                self.yaw_history.clear()
+                self.state = STATE_ALIGN_YAW
+                self.pub_cmd.publish(Twist())
+                return
+            
+            # 좌우 보정
+            cmd.angular.z = -self.k_lateral * lateral_error
+            cmd.angular.z = max(min(cmd.angular.z, self.max_angular), -self.max_angular)
+            
+            # 전진
+            cmd.linear.x = self.k_linear * dist_error
+            cmd.linear.x = max(min(cmd.linear.x, self.max_linear), 0.05)
+            
+            # ========================================
+            # [중요] 현재 회전 속도 기억
+            # ========================================
+            self.last_angular_vel = cmd.angular.z
+            
+            print(f"🚀 Approach | Lat:{lateral_error:+.2f}m | Dist:{dist_error:+.2f}m | Yaw:{yaw_error_deg:+.1f}°")
+        
+        elif self.state == STATE_ALIGN_YAW:
+            # 2단계: Yaw 정렬
+            
+            # 진동 감지
+            if self.check_oscillation(yaw_error_deg):
+                print(f"⚠️ Oscillation detected! Accepting Yaw={yaw_error_deg:.1f}°")
+                self.state = STATE_VERIFY
+                self.pub_cmd.publish(Twist())
+                return
+            
+            # 성공 조건
+            if abs(yaw_error_deg) < self.tolerance_yaw:
+                print(f"✅ Yaw aligned! Verifying...")
+                self.state = STATE_VERIFY
+                self.pub_cmd.publish(Twist())
+                return
+            
+            # 제자리 회전
+            cmd.linear.x = 0.0
+            cmd.angular.z = self.k_yaw * math.radians(yaw_error_deg)
+            cmd.angular.z = max(min(cmd.angular.z, self.max_angular), -self.max_angular)
+            
+            # ========================================
+            # [중요] 현재 회전 속도 기억
+            # ========================================
+            self.last_angular_vel = cmd.angular.z
+            
+            print(f"🔄 Aligning Yaw | Yaw:{yaw_error_deg:+.1f}° | AngVel:{cmd.angular.z:+.2f}")
+        
+        elif self.state == STATE_VERIFY:
+            # 3단계: 최종 확인
+            if (abs(lateral_error) < self.tolerance_lateral and 
+                abs(dist_error) < self.tolerance_dist and 
+                abs(yaw_error_deg) < self.tolerance_yaw):
+                print(f"🏁 Docking Complete!")
+                print(f"   Lat={lateral_error:+.2f}m | Dist={dist_error:+.2f}m | Yaw={yaw_error_deg:+.1f}°")
+                self.pub_cmd.publish(Twist())
+                self.docking_active = False
+                return
+            
+            # 큰 오차만 재시작
+            if abs(lateral_error) > 0.25 or abs(dist_error) > 0.15:
+                print(f"⚠️ Large drift detected. Restarting...")
+                self.state = STATE_APPROACH
+            else:
+                # 작은 오차는 무시하고 성공
+                print(f"✅ Minor drift OK. Completing...")
+                print(f"   Lat={lateral_error:+.2f}m | Dist={dist_error:+.2f}m | Yaw={yaw_error_deg:+.1f}°")
+                self.pub_cmd.publish(Twist())
+                self.docking_active = False
+            return
+        
+        self.pub_cmd.publish(cmd)
 
 def main():
     rclpy.init()
-    node = VisualServoBase()
+    node = SimplifiedDockingNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 

@@ -31,6 +31,7 @@ def generate_launch_description():
         "map",
         default=os.path.join(
             get_package_share_directory("carter_navigation"), "maps", "carter_hospital_navigation.yaml"
+            # get_package_share_directory("carter_navigation"), "maps", "carter_warehouse_navigation.yaml"
         ),
     )
 
