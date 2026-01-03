@@ -12,8 +12,6 @@ from std_srvs.srv import Trigger
 import numpy as np
 import math
 from enum import Enum
-from tf2_ros import Buffer, TransformListener
-from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
 def euler_from_quaternion(x, y, z, w):
     t0 = +2.0 * (w * x + y * z)
@@ -76,10 +74,7 @@ class SimplePrecisionDocking(Node):
         # 재정렬 카운터 (최대 2번 재시도)
         self.realignment_count = 0
         self.verification_start_time = None
-        # [추가] 정렬 시작 시간 (TF 안정화 대기용)
         self.align_start_time = None
-        
-        self.tf_update_timer = None  # TF 타이머 참조 저장
         
         # Subscribers/Publishers
         self.create_subscription(PoseStamped, 'detected_dock_pose', self.dock_pose_callback, 10)
@@ -132,13 +127,7 @@ class SimplePrecisionDocking(Node):
         cmd.linear.x = 0.0
         cmd.angular.z = 0.0
         self.cmd_vel_pub.publish(cmd)
-        
-        # 2. TF 업데이트 타이머 정리 (리소스 확보)
-        if self.tf_update_timer is not None:
-            self.tf_update_timer.cancel()
-            self.tf_update_timer = None
-            self.get_logger().info("⏸️  TF updates stopped (Docking Finished)")
-            
+
         # 3. 도킹 활성화 플래그 끄기
         self.docking_enabled = False
         
@@ -227,11 +216,8 @@ class SimplePrecisionDocking(Node):
                 cmd.linear.x = 0.0
                 cmd.angular.z = 0.0
                     
-                # [수정] 상태 전환 시 시작 시간 기록
+                # 상태 전환 시 시작 시간 기록
                 self.align_start_time = self.get_clock().now()
-                self.state = DockingState.ALIGN_TO_MARKER
-                self.get_logger().info(f"🎯 Distance Reached. Waiting for TF stabilization...")
-                
                 self.state = DockingState.ALIGN_TO_MARKER
                 self.get_logger().info(f"🎯 Distance Reached. Starting Grid Snap.")
 
@@ -239,13 +225,24 @@ class SimplePrecisionDocking(Node):
             if self.latest_dock_pose is None:
                 return
 
-            # 1. 마커의 상대적 Yaw 각도 계산
+            # 마커 데이터 유효성 검사
             q = self.latest_dock_pose.pose.orientation
+            if q.w == 0.0 and q.x == 0.0 and q.y == 0.0 and q.z == 0.0:
+                self.get_logger().warn("⚠️ Invalid Quaternion Detected!")
+                return
             
             # 오일러 변환 (roll, pitch, yaw)
+            # OpenCV 좌표계(Z전방, X우측, Y하방) 기준, Y축 회전이 로봇의 Yaw 편차임
             _, current_marker_yaw, _ = euler_from_quaternion(q.x, q.y, q.z, q.w)
             
-            yaw_error = current_marker_yaw
+            # EMA 필터 적용 (노이즈/튀는 값 억제)
+            if self.filtered_yaw is None:
+                self.filtered_yaw = current_marker_yaw
+            else:
+                self.filtered_yaw = (self.alpha * current_marker_yaw) + ((1 - self.alpha) * self.filtered_yaw)
+            
+            # 제어에는 필터된 값 사용
+            yaw_error = self.filtered_yaw
             
             self.get_logger().info(
                 f"📐 ALIGNING | Marker Yaw: {math.degrees(yaw_error):.2f}°",
@@ -290,6 +287,9 @@ class SimplePrecisionDocking(Node):
                 # 정렬 완료 -> 검증 단계로
                 cmd.linear.x = 0.0
                 cmd.angular.z = 0.0
+                
+                self.filtered_yaw = None
+                
                 self.verification_start_time = self.get_clock().now()
                 self.state = DockingState.VERIFY_ALIGNMENT
                 self.get_logger().info("⏸️ Marker Alignment Done. Verifying...")
@@ -298,14 +298,21 @@ class SimplePrecisionDocking(Node):
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
             
+            if self.latest_dock_pose is not None:
+                q = self.latest_dock_pose.pose.orientation
+                _, current_yaw, _ = euler_from_quaternion(q.x, q.y, q.z, q.w)
+                
+                if self.filtered_yaw is None:
+                    self.filtered_yaw = current_yaw
+                else:
+                    self.filtered_yaw = (self.alpha * current_yaw) + ((1 - self.alpha) * self.filtered_yaw)
+            
             wait_time = (self.get_clock().now() - self.verification_start_time).nanoseconds / 1e9
             
             if wait_time < 0.5:
                 self.get_logger().info(f"⏳ Stabilizing... ({wait_time:.1f}/0.5s)", throttle_duration_sec=0.5)
             else:
-                # [수정] TF 대신 마커 Yaw 재확인
-                q = self.latest_dock_pose.pose.orientation
-                _, final_yaw_rad, _ = euler_from_quaternion(q.x, q.y, q.z, q.w)
+                final_yaw_rad = self.filtered_yaw
                 
                 # 2. 판단을 위해 도로 변환
                 final_deg_error = math.degrees(abs(final_yaw_rad))
@@ -349,11 +356,6 @@ class SimplePrecisionDocking(Node):
     def stop_robot(self):
         cmd = Twist()
         self.cmd_vel_pub.publish(cmd)
-        
-        # TF 타이머 중지
-        if self.tf_update_timer is not None:
-            self.tf_update_timer.cancel()
-            self.tf_update_timer = None
         
         self.state = DockingState.IDLE
         
