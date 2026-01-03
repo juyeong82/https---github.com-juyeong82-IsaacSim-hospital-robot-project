@@ -34,20 +34,28 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'nav_commander = my_pkg.nav_commander:main',
-            'visual_servoing = my_pkg.visual_servoing:main',
-            'aruco_detector = my_pkg.aruco_detector:main',
-            'aruco_detector_front = my_pkg.aruco_detector_front:main',
-            'aruco_detector_debug = my_pkg.aruco_detector_debug:main',
-            'aruco_detector_left = my_pkg.aruco_detector_left:main',
-            'aruco_detector_left_org = my_pkg.aruco_detector_left_org:main',
-            'aruco_detector_right = my_pkg.aruco_detector_right:main',
+            # 1. AprilTag Docking & Pose Publisher (도킹 관련)
+            'april_docking_marker = my_pkg.april_docking_marker:main',
+            'april_docking_tf = my_pkg.april_docking_tf:main',
+            'april_pose_publisher_marker = my_pkg.april_pose_publisher_marker:main',
+            'april_pose_publisher_tf = my_pkg.april_pose_publisher_tf:main',
+
+            # 2. Arm Control (로봇팔 제어)
             'arm_action_server = my_pkg.arm_action_server:main',
-            # [추가] 도킹 중계 노드 등록
-            'dock_pose_publisher = my_pkg.dock_pose_publisher:main', 
-            'simple_precision_docking = my_pkg.simple_precision_docking:main',
-            'dock_pose_publisher_marker = my_pkg.dock_pose_publisher_marker:main', 
-            'simple_precision_docking_marker = my_pkg.simple_precision_docking_marker:main',
+
+            # 3. ArUco Detectors (마커 인식 - 카메라별)
+            'aruco_detector_debug = my_pkg.aruco_detector_debug:main',
+            'aruco_detector_front = my_pkg.aruco_detector_front:main',
+            'aruco_detector_gripper = my_pkg.aruco_detector_gripper:main',
+            'aruco_detector_left = my_pkg.aruco_detector_left:main',
+            'aruco_detector_right = my_pkg.aruco_detector_right:main',
+
+            # 4. Main Controllers (시스템 제어)
+            'master_controller = my_pkg.master_controller:main',
+            'nav_commander = my_pkg.nav_commander:main',
+
+            # 5. UI (사용자 인터페이스)
+            'ui = my_pkg.ui:main',
         ],
     },
 )

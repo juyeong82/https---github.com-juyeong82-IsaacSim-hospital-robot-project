@@ -37,19 +37,19 @@ def generate_launch_description():
     )
 
     # 2. 도킹 포즈 퍼블리셔 (Camera frame 출력)
-    dock_pose_publisher = Node(
+    april_pose_publisher = Node(
         package='my_pkg',
-        executable='dock_pose_publisher_marker',
-        name='dock_pose_publisher',
+        executable='april_pose_publisher_marker',
+        name='april_pose_publisher',
         output='screen',
         parameters=[{'use_sim_time': use_sim_time}]
     )
 
     # 3. Simple Precision Docking (자동 도킹)
-    precision_docking = Node(
+    april_docking = Node(
         package='my_pkg',
-        executable='simple_precision_docking_marker',
-        name='simple_precision_docking',
+        executable='april_docking_marker',
+        name='april_docking',
         output='screen',
         parameters=[
             {'use_sim_time': use_sim_time},
@@ -77,7 +77,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         apriltag_node,
-        dock_pose_publisher,
-        precision_docking,
+        april_pose_publisher,
+        april_docking,
         # tf_map_odom
     ])
