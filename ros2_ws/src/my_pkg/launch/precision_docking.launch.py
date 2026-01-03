@@ -50,7 +50,7 @@ def generate_launch_description():
             {'use_sim_time': use_sim_time},
             {'docking_distance_threshold': 2.2},  
             {'rotation_threshold': 0.087},        # 5도
-            {'approach_speed': 0.4},              # 접근 속도
+            {'approach_speed': 0.45},              # 접근 속도
             {'rotation_speed': 0.5},              # 회전 속도
             {'final_speed': 0.15},                # 최종 속도
             {'auto_start': True},                 # 자동 시작
