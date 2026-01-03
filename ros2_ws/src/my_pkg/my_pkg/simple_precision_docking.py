@@ -70,6 +70,11 @@ class SimplePrecisionDocking(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.current_yaw = 0.0
         
+        # 재정렬 카운터 (최대 2번 재시도)
+        self.realignment_count = 0
+        self.verification_start_time = None
+        
+        
         # Subscribers/Publishers
         self.create_subscription(PoseStamped, 'detected_dock_pose', self.dock_pose_callback, 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -82,8 +87,15 @@ class SimplePrecisionDocking(Node):
         self.get_logger().info('🎯 Simple Precision Docking Started (Optimized)')
 
     def get_robot_yaw_from_tf(self):
-        try:
-            transform = self.tf_buffer.lookup_transform(self.map_frame, self.base_frame, rclpy.time.Time())
+        try:            
+            # 최신 TF를 기다림 (최대 0.1초)
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame, 
+                self.base_frame, 
+                rclpy.time.Time(),  # 최신 시간
+                timeout=rclpy.duration.Duration(seconds=0.1)
+            )
+            
             q = transform.transform.rotation
             _, _, yaw = euler_from_quaternion(q.x, q.y, q.z, q.w)
             return yaw, True
@@ -93,6 +105,10 @@ class SimplePrecisionDocking(Node):
     def start_docking_callback(self, request, response):
         self.docking_enabled = True
         self.state = DockingState.IDLE
+        
+        self.realignment_count = 0
+        self.verification_start_time = None
+        
         response.success = True
         response.message = "Docking enabled"
         return response
@@ -118,6 +134,14 @@ class SimplePrecisionDocking(Node):
     def control_loop(self):
         if not self.docking_enabled:
             return
+        
+        # 데이터 신선도 체크: 0.2초 이상 된 데이터는 '과거 정보'로 간주
+        if self.latest_pose_time is not None:
+            pose_age = (self.get_clock().now() - self.latest_pose_time).nanoseconds / 1e9
+            if pose_age > 0.2 and self.state not in [DockingState.IDLE, DockingState.DOCKED]:
+                self.get_logger().warn(f"⌛ Stale data detected ({pose_age:.2f}s)! Braking...", throttle_duration_sec=1.0)
+                self.stop_robot() # 일단 멈추고 다음 신선한 데이터를 기다림
+                return
         
         if self.state == DockingState.IDLE:
             self.get_logger().info("💤 IDLE: Waiting for marker...", throttle_duration_sec=2.0)
@@ -194,19 +218,77 @@ class SimplePrecisionDocking(Node):
                 throttle_duration_sec=0.2
             )
             
-            # 진동 방지를 위한 정밀 감속 P-제어
-            if abs(yaw_error) > 0.017:  # 약 1.0도 임계값
-                # 오차가 클수록 빠르고, 작을수록 아주 느리게 (최소 0.05 rad/s 보장)
-                speed = np.clip(4.0 * yaw_error, -0.3, 0.3)
-                if abs(speed) < 0.05: speed = 0.05 if yaw_error > 0 else -0.05
+            if abs(yaw_error) > 0.017:  # 약 1도
+                # 1. 오차가 큰 경우 (예: 2.8도/0.05rad 이상): 강한 P-제어
+                if abs(yaw_error) > 0.05:  # 5.7도 이상
+                    gain = 4.0
+                    limit = 0.3
+                    
+                # 2. 중간 오차 (예: 1.0도/0.017rad ~ 2.8도 사이): 부드러운 감속 제어
+                else:
+                    gain = 2.0
+                    limit = 0.15
+                
+                speed = np.clip(gain * yaw_error, -limit, limit)
+                
+                # 최소 회전 속도 보장 (Dead zone 극복)
+                if abs(speed) < 0.03:
+                    speed = 0.03 if yaw_error > 0 else -0.03
+                
+                cmd.linear.x = 0.0
                 cmd.angular.z = speed
+            # else:
+            #     # 도킹 완료 및 "완전 종료"
+            #     cmd.angular.z = 0.0
+            #     self.cmd_vel_pub.publish(cmd)
+                
+            #     self.state = DockingState.DOCKED
+            #     self.docking_enabled = False # 프로세스 자동 중단
+            #     self.get_logger().info(f"🎉 DOCKED & FINISHED at Yaw: {math.degrees(self.current_yaw):.1f}°")
+            
             else:
-                # 도킹 완료 및 "완전 종료"
+                # 정렬 완료 - 재검증 단계로 전환
                 cmd.angular.z = 0.0
                 self.cmd_vel_pub.publish(cmd)
-                self.state = DockingState.DOCKED
-                self.docking_enabled = False # 프로세스 자동 중단
-                self.get_logger().info(f"🎉 DOCKED & FINISHED at Yaw: {math.degrees(self.current_yaw):.1f}°")
+                
+                # ============ 재검증 시작 ============
+                if self.verification_start_time is None:
+                    self.verification_start_time = self.get_clock().now()
+                    self.get_logger().info(f"⏸️  Alignment Done. Waiting 0.5s for verification... (Attempt {self.realignment_count + 1}/3)")
+                    return
+                
+                # 0.5초 대기 후 재검증
+                wait_time = (self.get_clock().now() - self.verification_start_time).nanoseconds / 1e9
+                if wait_time < 0.5:
+                    return  # 계속 대기
+                
+                # 대기 완료 - 자세 재확인
+                yaw, success = self.get_robot_yaw_from_tf()
+                if not success:
+                    self.get_logger().warn("⚠️ TF lookup failed during verification")
+                    return
+                
+                self.current_yaw = yaw
+                target_yaw = round(self.current_yaw / (math.pi / 2.0)) * (math.pi / 2.0)
+                final_error = target_yaw - self.current_yaw
+                while final_error > math.pi: final_error -= 2 * math.pi
+                while final_error < -math.pi: final_error += 2 * math.pi
+                
+                # 재검증 결과 판단
+                if abs(final_error) > 0.017 and self.realignment_count < 2:  # 1도 이상 틀어짐 & 재시도 가능
+                    self.realignment_count += 1
+                    self.verification_start_time = None
+                    self.get_logger().warn(
+                        f"🔄 Re-alignment needed! Error: {math.degrees(final_error):.2f}° (Retry {self.realignment_count}/2)"
+                    )
+                    # ALIGN_TO_GRID 상태 유지하여 재정렬
+                else:
+                    # 최종 도킹 완료
+                    self.state = DockingState.DOCKED
+                    self.docking_enabled = False
+                    self.get_logger().info(
+                        f"🎉 DOCKED & VERIFIED! Final Error: {math.degrees(final_error):.2f}° (Attempts: {self.realignment_count + 1})"
+                    )
 
         elif self.state == DockingState.DOCKED:
             cmd.linear.x = 0.0
@@ -218,6 +300,11 @@ class SimplePrecisionDocking(Node):
         cmd = Twist()
         self.cmd_vel_pub.publish(cmd)
         self.state = DockingState.IDLE
+        
+        # 재시도 카운터 초기화
+        self.realignment_count = 0
+        self.verification_start_time = None
+        
         self.get_logger().info("🛑 Robot Stopped and Controller Reset to IDLE")
 
 def main(args=None):
