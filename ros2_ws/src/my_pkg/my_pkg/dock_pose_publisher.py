@@ -13,6 +13,9 @@ class DockPosePublisher(Node):
         
         self.target_id = 4       
         self.tag_size = 0.25     # 태그 크기 25cm
+        
+        # 마지막 인식 시간 저장을 위한 변수
+        self.last_detection_time = self.get_clock().now()
 
         self.camera_matrix = None
         self.dist_coeffs = None
@@ -21,7 +24,7 @@ class DockPosePublisher(Node):
         self.create_subscription(AprilTagDetectionArray, '/detections', self.detection_callback, 10)
         self.publisher = self.create_publisher(PoseStamped, 'detected_dock_pose', 10)
         
-        self.get_logger().info("🚀 Camera Frame Mode - YAML handles rotation")
+        self.get_logger().info(f"🚀 Dock Pose Publisher Started (Target ID: {self.target_id})")
 
     def camera_info_callback(self, msg):
         if self.camera_matrix is None:
@@ -84,8 +87,10 @@ class DockPosePublisher(Node):
                     self.publisher.publish(pose_msg)
                     
                     self.get_logger().info(
-                        f"📷 Camera Frame: X={raw_x:.2f}, Y={raw_y:.2f}, Z={raw_z:.2f}"
+                        f"🔍 [TRACKING] ID:{self.target_id} | X:{raw_x:6.2f} Y:{raw_y:6.2f} Z:{raw_z:6.2f}",
+                        throttle_duration_sec=3.0  # 출력 빈도 1초로 제한
                     )
+                    self.last_detection_time = self.get_clock().now()
                 return
 
 def main(args=None):

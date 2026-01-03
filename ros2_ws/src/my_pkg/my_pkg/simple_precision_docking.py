@@ -118,6 +118,10 @@ class SimplePrecisionDocking(Node):
     def control_loop(self):
         if not self.docking_enabled:
             return
+        
+        if self.state == DockingState.IDLE:
+            self.get_logger().info("💤 IDLE: Waiting for marker...", throttle_duration_sec=2.0)
+            return
 
         # TF 기반 Yaw 업데이트 (필요한 상태에서만)
         if self.state in [DockingState.ALIGN_TO_GRID, DockingState.DOCKED]:
@@ -141,13 +145,23 @@ class SimplePrecisionDocking(Node):
         cmd = Twist()
         
         if self.state == DockingState.ROTATE_TO_TARGET:
+            self.get_logger().info(
+                f"🔄 ROTATING | Cur: {math.degrees(bearing_angle):.1f}° / Thresh: {math.degrees(self.rotation_threshold):.1f}°", 
+                throttle_duration_sec=0.5
+            )
+            
             if abs(bearing_angle) > self.rotation_threshold:
                 cmd.angular.z = np.clip(2.5 * bearing_angle, -self.rotation_speed, self.rotation_speed)
             else:
                 self.state = DockingState.APPROACH
-                self.get_logger().info("✅ Rotation aligned.")
+                self.get_logger().info("✅ Rotation aligned. Moving to APPROACH.")
                 
         elif self.state == DockingState.APPROACH:
+            self.get_logger().info(
+                f"➡️ APPROACH | Dist: {distance:.2f}m | Drift: {math.degrees(bearing_angle):.1f}°", 
+                throttle_duration_sec=0.5
+            )
+            
             if abs(bearing_angle) > 0.25: # 약 14도 이상 틀어지면 다시 회전
                 self.state = DockingState.ROTATE_TO_TARGET
                 return
@@ -174,6 +188,11 @@ class SimplePrecisionDocking(Node):
             yaw_error = target_yaw - self.current_yaw
             while yaw_error > math.pi: yaw_error -= 2 * math.pi
             while yaw_error < -math.pi: yaw_error += 2 * math.pi
+            
+            self.get_logger().info(
+                f"🧭 SNAPPING | Cur: {math.degrees(self.current_yaw):.1f}° -> Tgt: {math.degrees(target_yaw):.0f}° | Err: {math.degrees(yaw_error):.2f}°",
+                throttle_duration_sec=0.2
+            )
             
             # 진동 방지를 위한 정밀 감속 P-제어
             if abs(yaw_error) > 0.017:  # 약 1.0도 임계값
