@@ -45,11 +45,9 @@ setup(
             'arm_action_server = my_pkg.arm_action_server:main',
             # [추가] 도킹 중계 노드 등록
             'dock_pose_publisher = my_pkg.dock_pose_publisher:main', 
-            # [추가] 미션 커맨더 등록 (필요시)
-            'mission_commander = my_pkg.mission_commander:main',
-            'precision_docking_controller = my_pkg.precision_docking_controller:main',
             'simple_precision_docking = my_pkg.simple_precision_docking:main',
-            'simple_precision_docking_with_heading = my_pkg.simple_precision_docking_with_heading:main',
+            'dock_pose_publisher_marker = my_pkg.dock_pose_publisher_marker:main', 
+            'simple_precision_docking_marker = my_pkg.simple_precision_docking_marker:main',
         ],
     },
 )

@@ -34,47 +34,45 @@ def generate_launch_description():
     # 2. 도킹 포즈 퍼블리셔 (Camera frame 출력)
     dock_pose_publisher = Node(
         package='my_pkg',
-        executable='dock_pose_publisher',
+        executable='dock_pose_publisher_marker',
         name='dock_pose_publisher',
         output='screen',
         parameters=[{'use_sim_time': use_sim_time}]
     )
 
-    # 3. Simple Precision Docking (자동 도킹 + 절대 방향 정렬)
+    # 3. Simple Precision Docking (자동 도킹)
     precision_docking = Node(
         package='my_pkg',
-        executable='simple_precision_docking_with_heading',
-        name='simple_precision_docking_with_heading',
+        executable='simple_precision_docking_marker',
+        name='simple_precision_docking',
         output='screen',
         parameters=[
             {'use_sim_time': use_sim_time},
-            {'docking_distance_threshold': 0.4},  # 40cm에서 멈춤
+            {'docking_distance_threshold': 2.2},  
             {'rotation_threshold': 0.087},        # 5도
-            {'approach_speed': 0.4},              # 접근 속도
+            {'approach_speed': 0.45},              # 접근 속도
             {'rotation_speed': 0.5},              # 회전 속도
             {'final_speed': 0.15},                # 최종 속도
             {'auto_start': True},                 # 자동 시작
-            {'align_to_grid': True},              # 90도 단위 정렬 활성화
-            {'target_yaw': 0.0},                 # 목표 yaw: 90도 (북쪽)
         ]
     )
 
     # 4. TF (map → odom)
-    tf_map_odom = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        arguments = [
-            '--x', '0', '--y', '0', '--z', '0', 
-            '--yaw', '0', '--pitch', '0', '--roll', '0', 
-            '--frame-id', 'map', '--child-frame-id', 'odom'
-        ],
-        parameters=[{'use_sim_time': use_sim_time}],
-        output='screen'
-    )
+    # tf_map_odom = Node(
+    #     package='tf2_ros',
+    #     executable='static_transform_publisher',
+    #     arguments = [
+    #         '--x', '0', '--y', '0', '--z', '0', 
+    #         '--yaw', '0', '--pitch', '0', '--roll', '0', 
+    #         '--frame-id', 'map', '--child-frame-id', 'odom'
+    #     ],
+    #     parameters=[{'use_sim_time': use_sim_time}],
+    #     output='screen'
+    # )
 
     return LaunchDescription([
         apriltag_node,
         dock_pose_publisher,
         precision_docking,
-        tf_map_odom
+        # tf_map_odom
     ])
