@@ -84,6 +84,10 @@ class SimplePrecisionDocking(Node):
         self.create_service(Trigger, 'stop_docking', self.stop_docking_callback)
         
         self.create_timer(0.05, self.control_loop)
+        
+        # TF 업데이트 타이머 (10Hz)
+        self.create_timer(0.1, self.update_tf_yaw)
+        
         self.get_logger().info('🎯 Simple Precision Docking Started (Optimized)')
 
     def get_robot_yaw_from_tf(self):
@@ -130,7 +134,14 @@ class SimplePrecisionDocking(Node):
             if distance > 0.5:
                 self.state = DockingState.ROTATE_TO_TARGET
                 self.get_logger().info(f'🚀 Auto-start Triggered! (Dist={distance:.2f}m)')
-        
+    
+    def update_tf_yaw(self):
+        """TF 기반 yaw 업데이트 (10Hz)"""
+        if self.state in [DockingState.ALIGN_TO_GRID, DockingState.DOCKED]:
+            yaw, success = self.get_robot_yaw_from_tf()
+            if success:
+                self.current_yaw = yaw
+    
     def control_loop(self):
         if not self.docking_enabled:
             return
@@ -146,11 +157,6 @@ class SimplePrecisionDocking(Node):
         if self.state == DockingState.IDLE:
             self.get_logger().info("💤 IDLE: Waiting for marker...", throttle_duration_sec=2.0)
             return
-
-        # TF 기반 Yaw 업데이트 (필요한 상태에서만)
-        if self.state in [DockingState.ALIGN_TO_GRID, DockingState.DOCKED]:
-            yaw, success = self.get_robot_yaw_from_tf()
-            if success: self.current_yaw = yaw
 
         # Marker 기반 데이터 계산
         if self.state not in [DockingState.ALIGN_TO_GRID, DockingState.DOCKED, DockingState.IDLE]:
@@ -228,12 +234,36 @@ class SimplePrecisionDocking(Node):
                 else:
                     gain = 2.0
                     limit = 0.15
+                    
+                # ============ 재정렬 시 속도 감소 ============
+                if self.realignment_count > 0:
+                    # 재정렬 중: 더 느리고 부드럽게
+                    if abs(yaw_error) > 0.05:
+                        gain = 2.0  
+                        limit = 0.15  
+                    else:
+                        gain = 1.5   
+                        limit = 0.15  
+                    min_speed = 0.02  
+                else:
+                    # 첫 정렬: 기존 속도
+                    # 1. 오차가 큰 경우 (예: 2.8도/0.05rad 이상): 강한 P-제어
+                    if abs(yaw_error) > 0.05:  # 5.7도 이상
+                        gain = 4.0
+                        limit = 0.3
+                        
+                    # 2. 중간 오차 (예: 1.0도/0.017rad ~ 2.8도 사이): 부드러운 감속 제어
+                    else:
+                        gain = 2.0
+                        limit = 0.15
+                    min_speed = 0.03
+                    
                 
                 speed = np.clip(gain * yaw_error, -limit, limit)
                 
                 # 최소 회전 속도 보장 (Dead zone 극복)
-                if abs(speed) < 0.03:
-                    speed = 0.03 if yaw_error > 0 else -0.03
+                if abs(speed) < min_speed:
+                    speed = min_speed if yaw_error > 0 else -min_speed
                 
                 cmd.linear.x = 0.0
                 cmd.angular.z = speed
