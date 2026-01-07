@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>H-Logistics Control Center</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        /* 다크 모드 기반 스타일 */
+        body { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', Roboto, sans-serif; overflow-x: hidden; }
+        
+        /* 패널 공통 스타일 */
+        .panel { background-color: #1e1e1e; border: 1px solid #333; border-radius: 8px; padding: 15px; margin-bottom: 15px; }
+        .panel-title { color: #888; font-size: 0.85rem; font-weight: bold; margin-bottom: 10px; display: flex; align-items: center; gap: 5px; }
+        
+        /* 상태 배지 */
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
+        .badge-normal { background: #374151; color: #ccc; }
+        .badge-high { background: #991b1b; color: #fecaca; }
+        
+        /* 버튼 스타일 */
+        .btn-primary { 
+            background: linear-gradient(135deg, #2563eb, #1d4ed8); 
+            color: white; font-weight: bold; width: 100%; padding: 12px; border-radius: 6px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3); transition: transform 0.1s;
+        }
+        .btn-primary:active { transform: scale(0.98); }
+        
+        .btn-estop {
+            background: linear-gradient(135deg, #dc2626, #b91c1c);
+            color: white; font-weight: bold; width: 100%; padding: 12px; border-radius: 6px;
+            margin-top: 10px;
+        }
+
+        /* 로그 창 */
+        #log-area { 
+            background: #000; color: #0f0; font-family: monospace; font-size: 0.8rem; 
+            height: 150px; overflow-y: auto; padding: 10px; border: 1px solid #333; border-radius: 4px; 
+        }
+
+        /* 시뮬레이션 뷰 */
+        .camera-view {
+            background: #000; height: 200px; display: flex; flex-direction: column; 
+            align-items: center; justify-content: center; position: relative; border: 2px solid #333;
+        }
+        .overlay-text {
+            color: #0f0; font-family: monospace; font-size: 1.2rem; font-weight: bold; text-align: center;
+            text-shadow: 0 0 5px #0f0;
+        }
+
+        /* 셀렉트 박스 */
+        select {
+            width: 100%; background: #2d2d2d; color: white; border: 1px solid #444; 
+            padding: 10px; border-radius: 4px; margin-bottom: 10px;
+        }
+
+        /* 진행바 */
+        .progress-container { width: 100%; background: #333; height: 6px; border-radius: 3px; margin-top: 5px; }
+        .progress-bar { height: 100%; background: #2563eb; width: 0%; border-radius: 3px; transition: width 0.3s; }
+    </style>
+</head>
+<body class="p-4">
+
+    <!-- Header -->
+    <div class="flex justify-between items-center mb-6">
+        <div>
+            <h1 class="text-xl font-bold text-white"><i class="fa-solid fa-robot text-blue-500 mr-2"></i>H-LOGISTICS</h1>
+            <div class="text-xs text-gray-500">Autonomous Delivery Control System</div>
+        </div>
+        <div class="text-right">
+            <div id="clock" class="text-sm font-mono text-gray-400">12:00:00</div>
+            <div class="text-xs text-green-500"><i class="fa-solid fa-wifi"></i> ONLINE</div>
+        </div>
+    </div>
+
+    <!-- 1. Robot Status Panel -->
+    <div class="panel">
+        <div class="panel-title"><i class="fa-solid fa-gauge-high"></i> ROBOT STATUS</div>
+        <div class="flex justify-between items-center mb-2">
+            <div>
+                <span class="text-xs text-gray-400">STATE</span>
+                <div id="robot-state" class="text-lg font-bold text-gray-300">IDLE</div>
+            </div>
+            <div class="text-right">
+                <span class="text-xs text-gray-400">BATTERY</span>
+                <div class="text-lg font-bold text-green-400"><i class="fa-solid fa-battery-three-quarters"></i> <span id="battery-level">95</span>%</div>
+            </div>
+        </div>
+        <div class="progress-container">
+            <div id="task-progress" class="progress-bar"></div>
+        </div>
+    </div>
+
+    <!-- 2. Visualization (Camera) -->
+    <div class="panel p-0 overflow-hidden">
+        <div class="bg-gray-800 px-3 py-2 text-xs font-bold flex justify-between">
+            <span><i class="fa-solid fa-video"></i> ROBOT EYE (LIVE)</span>
+            <span class="text-red-500 animate-pulse">● REC</span>
+        </div>
+        <div class="camera-view" id="cam-view">
+            <i class="fa-solid fa-eye text-4xl text-gray-700 mb-2"></i>
+            <div id="cam-overlay" class="overlay-text">NO SIGNAL</div>
+            
+            <!-- ArUco Box Simulation (Hidden by default) -->
+            <div id="aruco-box" class="hidden absolute border-2 border-green-500 w-32 h-32 flex items-center justify-center">
+                <span class="text-green-500 text-xs bg-black px-1">ID: 12</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3. Control Panel (Task Dispatch) -->
+    <div class="panel">
+        <div class="panel-title"><i class="fa-solid fa-clipboard-list"></i> CREATE WORK ORDER</div>
+        
+        <label class="text-xs text-gray-400">ITEM TYPE</label>
+        <select id="item-select" onchange="updateDest()">
+            <option value="blood">🩸 Blood Sample (Emergency)</option>
+            <option value="medicine">💊 General Medicine</option>
+            <option value="narcotics">🔒 Narcotics (Secure)</option>
+            <option value="chart">📄 Medical Chart</option>
+        </select>
+
+        <div class="grid grid-cols-2 gap-2 mb-2">
+            <div>
+                <label class="text-xs text-gray-400">FROM</label>
+                <select id="from-select">
+                    <option>Nurse Station A</option>
+                    <option>Main Pharmacy</option>
+                    <option>Sub Pharmacy</option>
+                    <option>Central Supply</option>
+                </select>
+            </div>
+            <div>
+                <label class="text-xs text-gray-400">TO</label>
+                <select id="to-select">
+                    <option>Clinical Lab</option>
+                    <option>Ward 101</option>
+                    <option>Ward 102</option>
+                    <option>Doctor's Office</option>
+                </select>
+            </div>
+        </div>
+
+        <div id="priority-badge" class="badge badge-high inline-block mb-3">PRIORITY: HIGH</div>
+        
+        <button onclick="startMission()" id="btn-dispatch" class="btn-primary">
+            <i class="fa-solid fa-rocket"></i> DISPATCH ROBOT
+        </button>
+        <button onclick="emergencyStop()" class="btn-estop">
+            <i class="fa-solid fa-triangle-exclamation"></i> EMERGENCY STOP
+        </button>
+    </div>
+
+    <!-- 4. System Log -->
+    <div class="panel">
+        <div class="panel-title"><i class="fa-solid fa-terminal"></i> SYSTEM LOG</div>
+        <div id="log-area">
+            [SYSTEM] Logistics Core Online.<br>
+            [SYSTEM] Connected to ROS2 Bridge.<br>
+            [ROBOT] Initial Pose Estimate Complete.<br>
+            [ROBOT] Ready for command.
+        </div>
+    </div>
+
+    <script>
+        // 시계 업데이트
+        setInterval(() => {
+            const now = new Date();
+            document.getElementById('clock').innerText = now.toLocaleTimeString();
+        }, 1000);
+
+        // 아이템 선택 시 자동 설정
+        function updateDest() {
+            const item = document.getElementById('item-select').value;
+            const toSelect = document.getElementById('to-select');
+            const fromSelect = document.getElementById('from-select');
+            const badge = document.getElementById('priority-badge');
+
+            if(item === 'blood') {
+                fromSelect.value = "Nurse Station A";
+                toSelect.value = "Clinical Lab";
+                badge.className = "badge badge-high inline-block mb-3";
+                badge.innerText = "PRIORITY: HIGH (SAFETY MODE)";
+            } else if(item === 'medicine') {
+                fromSelect.value = "Main Pharmacy";
+                toSelect.value = "Ward 101";
+                badge.className = "badge badge-normal inline-block mb-3";
+                badge.innerText = "PRIORITY: NORMAL";
+            } else if(item === 'narcotics') {
+                fromSelect.value = "Sub Pharmacy";
+                toSelect.value = "Doctor's Office";
+                badge.className = "badge badge-high inline-block mb-3 bg-purple-900 text-purple-200";
+                badge.innerText = "PRIORITY: CRITICAL (SECURE)";
+            }
+        }
+        
+        // 초기 설정 실행
+        updateDest();
+
+        // 로그 출력 함수
+        function addLog(msg) {
+            const logArea = document.getElementById('log-area');
+            const time = new Date().toLocaleTimeString().split(' ')[0];
+            logArea.innerHTML += `[${time}] ${msg}<br>`;
+            logArea.scrollTop = logArea.scrollHeight;
+        }
+
+        // 시뮬레이션 로직
+        let isRunning = false;
+
+        function startMission() {
+            if(isRunning) return;
+            isRunning = true;
+            
+            const itemText = document.getElementById('item-select').options[document.getElementById('item-select').selectedIndex].text;
+            const fromLoc = document.getElementById('from-select').value;
+            const toLoc = document.getElementById('to-select').value;
+            const btn = document.getElementById('btn-dispatch');
+            
+            btn.disabled = true;
+            btn.classList.add('opacity-50');
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> PROCESSING...';
+
+            addLog(`>> WORK ORDER: ${itemText}`);
+            addLog(`>> ROUTE: ${fromLoc} -> ${toLoc}`);
+
+            // 시나리오 단계별 실행 (setTimeout 지옥 대신 async/await 흉내)
+            runScenario(itemText);
+        }
+
+        function runScenario(item) {
+            const stateLabel = document.getElementById('robot-state');
+            const camOverlay = document.getElementById('cam-overlay');
+            const arucoBox = document.getElementById('aruco-box');
+            const progressBar = document.getElementById('task-progress');
+
+            // 1. 이동 (Navigating)
+            updateState("NAVIGATING", "blue");
+            camOverlay.innerText = "MOVING TO PICKUP...";
+            progressBar.style.width = "20%";
+            addLog("[Nav2] Path planned. Moving...");
+
+            setTimeout(() => {
+                // 2. 비전 인식 (Vision)
+                updateState("SCANNING", "orange");
+                camOverlay.innerText = "SEARCHING ARUCO...";
+                progressBar.style.width = "40%";
+                addLog("[Vision] Scanning for target...");
+
+                setTimeout(() => {
+                    // 인식 성공 연출
+                    arucoBox.classList.remove('hidden');
+                    camOverlay.innerText = "TARGET DETECTED";
+                    camOverlay.style.color = "#0f0";
+                    addLog(`[Vision] Detected: ${item.split(' ')[1]}`);
+
+                    setTimeout(() => {
+                        // 3. 파지 (Manipulation)
+                        updateState("GRASPING", "purple");
+                        arucoBox.classList.add('hidden');
+                        camOverlay.innerText = "RMPFLOW ACTIVE";
+                        progressBar.style.width = "60%";
+                        addLog("[Arm] Executing Grasp Sequence...");
+
+                        setTimeout(() => {
+                            // 4. 배송 이동
+                            updateState("DELIVERING", "blue");
+                            camOverlay.innerText = "AUTONOMOUS DRIVING";
+                            progressBar.style.width = "80%";
+                            
+                            // 긴급 혈액일 경우 메시지 추가
+                            if(item.includes("Blood")) {
+                                addLog("[Nav2] Safety Mode: Velocity Limit ON");
+                            } else {
+                                addLog("[Nav2] Obstacle Avoidance Active");
+                            }
+
+                            setTimeout(() => {
+                                // 5. 완료
+                                updateState("IDLE", "gray");
+                                camOverlay.innerText = "NO SIGNAL";
+                                camOverlay.style.color = "#0f0";
+                                progressBar.style.width = "100%";
+                                addLog("[System] Mission Complete!");
+                                
+                                // 버튼 복구
+                                const btn = document.getElementById('btn-dispatch');
+                                btn.disabled = false;
+                                btn.classList.remove('opacity-50');
+                                btn.innerHTML = '<i class="fa-solid fa-rocket"></i> DISPATCH ROBOT';
+                                isRunning = false;
+
+                                setTimeout(() => { progressBar.style.width = "0%"; }, 2000);
+
+                            }, 3000); // 배송 시간
+                        }, 2000); // 파지 시간
+                    }, 1500); // 인식 대기
+                }, 2000); // 이동 시간
+            }, 1000); // 시작 딜레이
+        }
+
+        function updateState(text, colorClass) {
+            const el = document.getElementById('robot-state');
+            el.innerText = text;
+            if(colorClass === 'blue') el.style.color = "#3b82f6";
+            if(colorClass === 'orange') el.style.color = "#f59e0b";
+            if(colorClass === 'purple') el.style.color = "#a855f7";
+            if(colorClass === 'gray') el.style.color = "#d1d5db";
+            if(colorClass === 'red') el.style.color = "#ef4444";
+        }
+
+        function emergencyStop() {
+            updateState("ESTOP", "red");
+            addLog("!!! EMERGENCY STOP !!!");
+            document.getElementById('cam-overlay').innerText = "SYSTEM HALTED";
+            document.getElementById('cam-overlay').style.color = "red";
+            isRunning = false;
+        }
+
+    </script>
+</body>
+</html>

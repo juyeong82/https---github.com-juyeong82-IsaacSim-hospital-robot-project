@@ -47,27 +47,30 @@ class ArmActionServer(Node):
         
         self.home_joints = [0.0, -1.5708, -1.5708, -1.5708, 1.5708, 0.0]
         
-        # left_camera로 검증시
-        # self.verify_pose = PoseStamped()
-        # self.verify_pose.header.frame_id = "base_link"
-        # self.verify_pose.pose.position.x = -0.4
-        # self.verify_pose.pose.position.y = 0.8
-        # self.verify_pose.pose.position.z = 1.2
-        # self.verify_pose.pose.orientation.w = 0.707
-        # self.verify_pose.pose.orientation.y = 0.707
-        # self.verify_pose.pose.orientation.x = 0.0
-        # self.verify_pose.pose.orientation.z = 0.0
+        # Left Verify Pose (Target Y > 0 일 때 사용)
+        self.verify_pose_left = PoseStamped()
+        self.verify_pose_left.header.frame_id = "base_link"
+        self.verify_pose_left.pose.position.x = -0.4
+        self.verify_pose_left.pose.position.y = 0.8  # 좌측
+        self.verify_pose_left.pose.position.z = 1.2
+        self.verify_pose_left.pose.orientation.w = 0.707
+        self.verify_pose_left.pose.orientation.y = 0.707
+        self.verify_pose_left.pose.orientation.x = 0.0
+        self.verify_pose_left.pose.orientation.z = 0.0
         
-        # right_camera로 검증시
-        self.verify_pose = PoseStamped()
-        self.verify_pose.header.frame_id = "base_link"
-        self.verify_pose.pose.position.x = -0.4
-        self.verify_pose.pose.position.y = -0.8
-        self.verify_pose.pose.position.z = 1.2
-        self.verify_pose.pose.orientation.x = -0.707
-        self.verify_pose.pose.orientation.y = 0.0
-        self.verify_pose.pose.orientation.z = 0.707
-        self.verify_pose.pose.orientation.w = 0.0
+        # Right Verify Pose (Target Y < 0 일 때 사용)
+        self.verify_pose_right = PoseStamped()
+        self.verify_pose_right.header.frame_id = "base_link"
+        self.verify_pose_right.pose.position.x = -0.4
+        self.verify_pose_right.pose.position.y = -0.8 # 우측
+        self.verify_pose_right.pose.position.z = 1.2
+        self.verify_pose_right.pose.orientation.x = -0.707
+        self.verify_pose_right.pose.orientation.y = 0.0
+        self.verify_pose_right.pose.orientation.z = 0.707
+        self.verify_pose_right.pose.orientation.w = 0.0
+        
+        # 현재 선택된 검증 위치를 담을 변수
+        self.current_verify_pose = None
 
         self.get_logger().info('✅ Arm Action Server Ready (Multi-Threaded)')
 
@@ -123,12 +126,17 @@ class ArmActionServer(Node):
         return False
 
     def verify_grasp_success(self, timeout=5.0, tolerance=0.1):
-        # 1. 기존 데이터 초기화 (Stale Data 방지)
+        # 기존 데이터 초기화 (Stale Data 방지)
         self.visible_markers = [] 
         
-        target_x = self.verify_pose.pose.position.x
-        target_y = self.verify_pose.pose.position.y
-        target_z = self.verify_pose.pose.position.z
+        # [변경] self.verify_pose 대신 self.current_verify_pose 사용
+        if self.current_verify_pose is None:
+            self.get_logger().error("❌ No verify pose selected!")
+            return False
+        
+        target_x = self.current_verify_pose.pose.position.x
+        target_y = self.current_verify_pose.pose.position.y
+        target_z = self.current_verify_pose.pose.position.z
 
         start_time = time.time()
         
@@ -173,6 +181,15 @@ class ArmActionServer(Node):
             if action_type == 'pick':
                 target_pose = goal_handle.request.target_pose
                 
+                # Target Y 좌표에 따라 검증 위치(Left/Right) 자동 선택
+                tgt_y = target_pose.pose.position.y
+                if tgt_y > 0:
+                    self.current_verify_pose = self.verify_pose_left
+                    self.get_logger().info(f"🧭 Target Y={tgt_y:.2f} (Left) -> Set Verify Pose LEFT")
+                else:
+                    self.current_verify_pose = self.verify_pose_right
+                    self.get_logger().info(f"🧭 Target Y={tgt_y:.2f} (Right) -> Set Verify Pose RIGHT")
+                
                 self.control_gripper("open")
                 
                 # Pre-Approach
@@ -203,9 +220,10 @@ class ArmActionServer(Node):
                 if not self.wait_until_reached(lift_pose, timeout=60.0, tolerance=0.03):
                     self.get_logger().warn("⚠️ Lift incomplete, but moving to verify...")
 
-                # 6. [Verify Move] 검증 위치로 이동
-                self.publish_pose(self.verify_pose)
-                if not self.wait_until_reached(self.verify_pose):
+                # [Verify Move] 검증 위치로 이동
+                self.publish_pose(self.current_verify_pose)
+                
+                if not self.wait_until_reached(self.current_verify_pose):
                     raise Exception("Verification Move Timeout")
                 
                 if self.verify_grasp_success(tolerance=0.1):
@@ -213,7 +231,6 @@ class ArmActionServer(Node):
                     result.success = True
                     result.message = "Pick Success"
                 else:
-                    # self.control_gripper("open")
                     raise Exception("Grasp Failed (Marker not visible)")
 
             elif action_type == 'place':

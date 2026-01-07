@@ -23,3 +23,7 @@ ros2_ws/log/
 # 원본 백업 및 수집 과정에서 생긴 중복 폴더 제외
 assets/Collected_nova v9 original/
 assets/Collected_nova v9/
+assets/Collected_hospital/
+assets/main_space_v1/
+assets/Collected_hospital/
+assets/main_space_v2/

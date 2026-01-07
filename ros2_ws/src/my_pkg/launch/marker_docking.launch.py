@@ -58,7 +58,7 @@ def generate_launch_description():
             {'approach_speed': 0.45},              # 접근 속도
             {'rotation_speed': 0.5},              # 회전 속도
             {'final_speed': 0.15},                # 최종 속도
-            {'auto_start': True},                 # 자동 시작
+            {'auto_start': False},                 # 자동 시작
         ]
     )
 

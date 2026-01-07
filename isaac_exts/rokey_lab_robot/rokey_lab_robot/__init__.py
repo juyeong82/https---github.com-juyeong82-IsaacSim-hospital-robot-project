@@ -18,4 +18,7 @@
 from .lab_robot_main import LabRobotMain
 from .lab_robot_extension import LabRobotExtension
 
+from .lab_robot_main2 import LabRobotMain2
+from .lab_robot_extension2 import LabRobotExtension2
+
 # (HelloWorld 관련 내용은 불필요하다면 삭제해도 됩니다. UR10만 쓴다면 위 두 줄이면 충분합니다.)
