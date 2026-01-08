@@ -29,10 +29,13 @@ class ArmActionServer(Node):
         self.joint_pub = self.create_publisher(Float64MultiArray, '/joint_command', 10, callback_group=self.callback_group)
         self.gripper_pub = self.create_publisher(String, '/gripper_command', 10, callback_group=self.callback_group)
         
-        # Subscriber (Vision)
-        self.visible_markers = [] 
-        self.create_subscription(MarkerArray, '/vision/left_markers', self.vision_callback, 10, callback_group=self.callback_group)
-        self.create_subscription(MarkerArray, '/vision/right_markers', self.vision_callback, 10, callback_group=self.callback_group)
+        # [수정 1] 마커 저장 변수 분리
+        self.left_markers = []
+        self.right_markers = []
+        
+        # [수정 2] 콜백 함수 분리하여 구독
+        self.create_subscription(MarkerArray, '/vision/left_markers', self.vision_callback_left, 10, callback_group=self.callback_group)
+        self.create_subscription(MarkerArray, '/vision/right_markers', self.vision_callback_right, 10, callback_group=self.callback_group)
 
         # TF Listener
         self.tf_buffer = Buffer()
@@ -78,8 +81,12 @@ class ArmActionServer(Node):
 
         self.get_logger().info('✅ Arm Action Server Ready (Multi-Threaded)')
 
-    def vision_callback(self, msg):
-        self.visible_markers = msg.markers
+    # [수정 3] 분리된 콜백 함수 정의
+    def vision_callback_left(self, msg):
+        self.left_markers = msg.markers
+
+    def vision_callback_right(self, msg):
+        self.right_markers = msg.markers
 
     def get_current_tip_pose(self):
         try:
@@ -180,9 +187,7 @@ class ArmActionServer(Node):
         self.get_logger().warn(f"   ⚠️ Timeout! Final Dist: {dist:.3f}m, Angle: {math.degrees(angle_diff):.2f}°")
         return False
 
-    def verify_grasp_success(self, timeout=5.0, tolerance=0.1):
-        # 기존 데이터 초기화 (Stale Data 방지)
-        self.visible_markers = [] 
+    def verify_grasp_success(self, timeout=15.0, tolerance=0.1):
         
         # [변경] self.verify_pose 대신 self.current_verify_pose 사용
         if self.current_verify_pose is None:
@@ -198,27 +203,31 @@ class ArmActionServer(Node):
         self.get_logger().info(f"🔎 Verifying Grasp... Target Area: ({target_x:.2f}, {target_y:.2f}, {target_z:.2f})")
 
         while time.time() - start_time < timeout:
-            # 데이터 수신 대기
-            if len(self.visible_markers) > 0:
-                for marker in self.visible_markers:
+            # [핵심] 방향에 맞는 마커 리스트 가져오기
+            markers_to_check = []
+            if self.current_verify_side == "Left":
+                markers_to_check = self.left_markers
+            elif self.current_verify_side == "Right":
+                markers_to_check = self.right_markers
+                
+            if len(markers_to_check) > 0:
+                for marker in markers_to_check:
                     # 마커 좌표 (Robot Base 기준)
                     mx = marker.pose.position.x
                     my = marker.pose.position.y
                     mz = marker.pose.position.z
                     
-                    # 2. 거리 오차 계산 (Euclidean Distance)
                     dx = target_x - mx
                     dy = target_y - my
                     dz = target_z - mz
                     distance = math.sqrt(dx*dx + dy*dy + dz*dz)
                     
-                    # 3. 판단 (오차 범위 내에 들어왔는가?)
                     if distance < tolerance:
-                        self.get_logger().info(f"👁️ Success! Marker is near gripper. (Dist: {distance:.3f}m < {tolerance}m)")
+                        self.get_logger().info(f"👁️ Success! Marker found. (Dist: {distance:.3f}m)")
                         return True
                     else:
-                        # 마커가 보이긴 하는데 엉뚱한 곳(예: 바닥)에 있음
-                        self.get_logger().warn(f"⚠️ Marker seen, but too far from gripper. (Dist: {distance:.3f}m)")
+                        pass 
+                        # self.get_logger().warn(f"Marker seen but far: {distance:.2f}m", throttle_duration_sec=1)
             
             time.sleep(0.1)
             
@@ -235,15 +244,17 @@ class ArmActionServer(Node):
         try:
             if action_type == 'pick':
                 target_pose = goal_handle.request.target_pose
-                
-                # Target Y 좌표에 따라 검증 위치(Left/Right) 자동 선택
+                    
+                # [수정 5] 검증 방향(Side) 설정 추가
                 tgt_y = target_pose.pose.position.y
                 if tgt_y > 0:
                     self.current_verify_pose = self.verify_pose_left
-                    self.get_logger().info(f"🧭 Target Y={tgt_y:.2f} (Left) -> Set Verify Pose LEFT")
+                    self.current_verify_side = "Left" # 변수 업데이트
+                    self.get_logger().info(f"🧭 Target Y={tgt_y:.2f} -> Verify: LEFT")
                 else:
                     self.current_verify_pose = self.verify_pose_right
-                    self.get_logger().info(f"🧭 Target Y={tgt_y:.2f} (Right) -> Set Verify Pose RIGHT")
+                    self.current_verify_side = "Right" # 변수 업데이트
+                    self.get_logger().info(f"🧭 Target Y={tgt_y:.2f} -> Verify: RIGHT")
                 
                 self.control_gripper("open")
                 
@@ -266,7 +277,7 @@ class ArmActionServer(Node):
                 
                 # 5. [Lift] 수직 상승
                 lift_pose = copy.deepcopy(target_pose)
-                lift_pose.pose.position.z += 0.30
+                lift_pose.pose.position.z += 0.20
                 
                 self.get_logger().info("⬆️ Lifting Object...")
                 self.publish_pose(lift_pose)

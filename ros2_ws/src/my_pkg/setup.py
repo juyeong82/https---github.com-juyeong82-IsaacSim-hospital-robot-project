@@ -39,6 +39,8 @@ setup(
             'april_docking_tf = my_pkg.april_docking_tf:main',
             'april_pose_publisher_marker = my_pkg.april_pose_publisher_marker:main',
             'april_pose_publisher_tf = my_pkg.april_pose_publisher_tf:main',
+            'test_undock = my_pkg.test_undock:main',
+            'undock_test_node = my_pkg.undock_test_node:main',
 
             # 2. Arm Control (로봇팔 제어)
             'arm_action_server = my_pkg.arm_action_server:main',

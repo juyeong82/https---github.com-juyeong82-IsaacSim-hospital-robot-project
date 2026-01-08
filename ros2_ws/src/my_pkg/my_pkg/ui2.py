@@ -50,6 +50,7 @@ class RobotWorker(QThread):
     battery_signal = pyqtSignal(int)      
     cam_overlay_signal = pyqtSignal(str)
     task_finished_signal = pyqtSignal()
+    retry_request_signal = pyqtSignal(dict, str, str)
 
     def __init__(self):
         super().__init__()
@@ -160,11 +161,11 @@ class RobotWorker(QThread):
         result_wrapper = result_future.result()
         status = result_wrapper.status
         result = result_wrapper.result
-
+        
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.log_signal.emit(f"🎉 Step Completed: {result.message}")
             self.update_state("IDLE", "대기 중")
-            self.progress_signal.emit(100 if mode == "ALL" else 0) # 부분 실행은 완료 후 리셋
+            self.progress_signal.emit(100 if mode == "ALL" else 0)
             self.cam_overlay_signal.emit("STEP DONE")
         elif status == GoalStatus.STATUS_CANCELED:
             self.log_signal.emit(f"🛑 CANCELED: {result.message}")
@@ -172,12 +173,15 @@ class RobotWorker(QThread):
         else:
             self.log_signal.emit(f"💥 Failed: {result.message}")
             self.update_state("ERROR", result.message)
+            # 재시도 요청 시, 현재 멈춘 단계(self._last_feedback_state)도 함께 전달
+            self.retry_request_signal.emit(task, result.message, self._last_feedback_state)
 
         self.is_busy = False
         self._current_goal_handle = None
 
     def feedback_callback(self, feedback_msg):
         state = feedback_msg.feedback.current_state
+        self._last_feedback_state = state  # 상태 업데이트 될 때마다 저장
         self.state_signal.emit(state)
         # 로그 과다 출력 방지
         # self.log_signal.emit(f"▶ {state}") 
@@ -215,6 +219,7 @@ class HospitalControlCenter(QMainWindow):
         self.robot.battery_signal.connect(self.update_battery)
         self.robot.cam_overlay_signal.connect(self.update_cam_overlay)
         self.robot.task_finished_signal.connect(self.refresh_queue_list)
+        self.robot.retry_request_signal.connect(self.handle_retry_request)
         self.robot.start()
 
         self.init_ui()
@@ -328,9 +333,15 @@ class HospitalControlCenter(QMainWindow):
         step_layout.addWidget(create_step_btn("6. Place Item", "PLACE"), 3, 2)
         
         # Utils
-        btn_home = create_step_btn("🏠 Home Arm", "HOME")
+        btn_nav_home = create_step_btn("🏠 Nav to Home", "NAV_HOME")
+        btn_nav_home.setStyleSheet("background-color: #2e7d32; border: 1px solid #4caf50;")
+        step_layout.addWidget(btn_nav_home, 4, 0)
+        
+        btn_home = create_step_btn("🦾 Home Arm", "HOME")
         btn_home.setStyleSheet("background-color: #555; border: 1px solid #777;")
-        step_layout.addWidget(btn_home, 4, 0, 1, 3)
+        step_layout.addWidget(btn_home, 4, 1, 1, 2)
+        
+        
 
         grp_step.setLayout(step_layout)
 
@@ -493,6 +504,39 @@ class HospitalControlCenter(QMainWindow):
     def update_progress(self, val): self.bar_progress.setValue(val)
     def update_battery(self, val): self.bar_battery.setValue(val)
     def update_cam_overlay(self, text): self.lbl_cam_overlay.setText(text)
+    
+    # [수정] 실패한 단계부터 이어하기 로직 적용
+    def handle_retry_request(self, failed_task, error_msg, last_state):
+        """실패한 태스크에 대해 재시도 여부를 사용자에게 확인 (이어하기 기능 포함)"""
+        mode = failed_task.get('mode', 'ALL')
+        item = failed_task.get('item', 'Unknown')
+        
+        # 1. 실패한 상태(last_state)를 기반으로 재시작할 단계 매핑
+        resume_mode = "ALL" # 기본값
+        if "NAVIGATING TO PICKUP" in last_state: resume_mode = "NAV_PICKUP_CONT"
+        elif "DOCKING AT PICKUP" in last_state:  resume_mode = "DOCK_PICKUP_CONT"
+        elif "PICKING" in last_state:            resume_mode = "PICK_CONT" # SCANNING & PICKING
+        elif "NAVIGATING TO DROPOFF" in last_state: resume_mode = "NAV_DROPOFF_CONT"
+        elif "DOCKING AT DROPOFF" in last_state: resume_mode = "DOCK_DROPOFF_CONT"
+        elif "PLACING" in last_state:            resume_mode = "PLACE_CONT"
+        elif "RETURNING" in last_state:          resume_mode = "NAV_HOME_CONT"
+        
+        msg = f"작업 실패!\n\n모드: {mode}\n중단 지점: {last_state}\n\n'예'를 누르면 [{resume_mode}] 모드로 이어서 진행합니다."
+        
+        ret = QMessageBox.question(
+            self, "⚠️ Task Failed - Resume?", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if ret == QMessageBox.StandardButton.Yes:
+            # 이어하기용 새로운 태스크 생성
+            new_task = failed_task.copy()
+            new_task['mode'] = resume_mode
+            
+            self.add_log(f"🔄 Resuming Task: {resume_mode}...")
+            self.robot.execute_immediate(new_task)
+        else:
+            self.add_log(f"❌ Retry skipped by user.")
 
 def main(args=None):
     app = QApplication(sys.argv)

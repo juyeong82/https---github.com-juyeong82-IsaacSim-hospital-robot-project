@@ -11,11 +11,27 @@ import numpy as np
 from action_msgs.msg import GoalStatus
 # [Action Interfaces]
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import Odometry  # 오도메트리 추가
 from moma_interfaces.action import Dock, MoveManipulator, RunDelivery
 from moma_interfaces.msg import MarkerArray
 
 from scipy.spatial.transform import Rotation 
 import numpy as np
+
+# [변환 함수 추가: 클래스 밖 전역 함수로 배치]
+def euler_from_quaternion(x, y, z, w):
+    """쿼터니언 -> 오일러각 변환 (Roll, Pitch, Yaw)"""
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll_x = math.atan2(t0, t1)
+    t2 = +2.0 * (w * y - z * x)
+    t2 = +1.0 if t2 > +1.0 else t2
+    t2 = -1.0 if t2 < -1.0 else t2
+    pitch_y = math.asin(t2)
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw_z = math.atan2(t3, t4)
+    return roll_x, pitch_y, yaw_z
 
 class HospitalOrchestrator(Node):
     def __init__(self):
@@ -106,6 +122,11 @@ class HospitalOrchestrator(Node):
 
         # 마커 인식기(april_pose_publisher) On/Off 제어용
         self.pub_dock_trigger = self.create_publisher(Bool, '/docking/trigger', 10)
+        
+        # 언도킹 정밀 제어를 위한 오도메트리 구독
+        self.create_subscription(Odometry, '/chassis/odom', self.odom_callback, 10, callback_group=self.cb_group)
+        self.current_odom_yaw = None
+        self.latest_pose_time = self.get_clock().now() # 마커 데이터 타임스탬프용
 
         self.get_logger().info("🏥 Hospital Main Node Ready (Waiting for UI Command...)")
 
@@ -218,14 +239,16 @@ class HospitalOrchestrator(Node):
             ps.header = msg.header  # 핵심: 여기서 frame_id를 받아옵니다.
             ps.pose = m.pose
             self.detected_markers[m.id] = ps
-
+            
     def set_vision(self, side, enable):
         msg = Bool()
         msg.data = enable
-        if side == "Left":
-            self.pub_enable_left.publish(msg)
-        elif side == "Right":
-            self.pub_enable_right.publish(msg)
+        for _ in range(3):  # 3회 반복 발행
+            if side == "Left":
+                self.pub_enable_left.publish(msg)
+            elif side == "Right":
+                self.pub_enable_right.publish(msg)
+            time.sleep(0.05)  # 50ms 간격
 
     async def wait_for_marker(self, target_id, side, timeout=5.0):
         """특정 ID 마커가 보일 때까지 대기"""
@@ -253,100 +276,264 @@ class HospitalOrchestrator(Node):
     # [추가] 마커 포즈 콜백 (언도킹용)
     def dock_pose_callback(self, msg):
         self.latest_dock_pose = msg
+        
+    # [추가] 오도메트리 콜백
+    def odom_callback(self, msg):
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion(q.x, q.y, q.z, q.w)
+        self.current_odom_yaw = yaw
 
-    # [추가] 마커 기반 정밀 언도킹 (회전 -> 후진)
-    async def undock_using_marker(self, approach_side, reverse_dist=0.6):
-        """
-        approach_side: "Left" (테이블이 로봇 오른쪽) 또는 "Right" (테이블이 로봇 왼쪽)
-        reverse_dist: 후진할 거리 (미터)
-        """
-        self.get_logger().info(f"🔙 Starting Undocking Sequence (Side: {approach_side})")
-        
-        # 1. 마커 인식기 켜기
-        self.pub_dock_trigger.publish(Bool(data=True))
-        time.sleep(1.0) # 인식 안정화 대기
-        
-        # 2. 목표 회전 각도 설정 (10도 = 약 0.17 라디안)
-        # Left 접근(테이블 오른쪽) -> 로봇 머리를 오른쪽으로(CW) -> Target Yaw: -10도
-        # Right 접근(테이블 왼쪽) -> 로봇 머리를 왼쪽으로(CCW) -> Target Yaw: +10도
-        target_yaw_deg = -10.0 if approach_side == "Left" else 10.0
-        target_yaw_rad = math.radians(target_yaw_deg)
-        
-        cmd = Twist()
-        rate = self.create_rate(20) # 20Hz
-        
-        # --- Phase 1: 제자리 회전 (마커 기준 정렬) ---
-        self.get_logger().info(f"🔄 Undock: Rotating to {target_yaw_deg} deg...")
-        start_time = time.time()
-        
-        while rclpy.ok() and (time.time() - start_time < 5.0): # 최대 5초 시도
-            if self.latest_dock_pose:
-                # 현재 마커와의 각도(Bearing) 계산
-                # (april_docking_marker 로직과 동일하게 계산)
-                lateral = -self.latest_dock_pose.pose.position.x
-                distance = self.latest_dock_pose.pose.position.z
-                current_yaw = np.arctan2(lateral, distance)
-                
-                yaw_error = target_yaw_rad - current_yaw
-                
-                # 오차 2도 이내면 정지
-                if abs(yaw_error) < math.radians(2.0):
-                    break
-                
-                # P제어 회전
-                cmd.linear.x = 0.0
-                cmd.angular.z = np.clip(2.0 * yaw_error, -0.4, 0.4)
-                self.pub_cmd_vel.publish(cmd)
-            else:
-                # 마커 놓침 방지 (잠시 정지)
-                self.pub_cmd_vel.publish(Twist())
-                
-            rate.sleep()
-            
-        # 정지
+    # [수정] dock_pose_callback (타임스탬프 업데이트 추가)
+    def dock_pose_callback(self, msg):
+        self.latest_dock_pose = msg
+        self.latest_pose_time = self.get_clock().now()
+
+    # [추가] 마커 오리엔테이션 Yaw 추출 헬퍼
+    def get_marker_orientation_yaw(self):
+        if self.latest_dock_pose:
+            q = self.latest_dock_pose.pose.orientation
+            # 쿼터니언이 유효하지 않은 경우 방지
+            if q.w == 0.0 and q.x == 0.0 and q.y == 0.0 and q.z == 0.0:
+                return None
+            _, yaw, _ = euler_from_quaternion(q.x, q.y, q.z, q.w)
+            return yaw
+        return None
+    
+    # [추가] 로봇 정지 헬퍼
+    def stop_robot(self):
         self.pub_cmd_vel.publish(Twist())
+
+    async def undock_using_marker(self, approach_side, reverse_dist=2.0):
+        """
+        검증된 3단계 언도킹 로직 적용
+        Phase 1: 제자리 회전 정렬 (Marker Orientation 기준)
+        Phase 2: 후진 및 자세 보정 (Active Yaw Correction)
+        Phase 3: 최종 170도 회전 (Odom 기준)
+        """
+        self.get_logger().info(f"\n🚀 Starting Precision Undock: {approach_side} Side")
+        
+        # 설정값 정의 (테스트 노드 값 준수)
+        TARGET_ANGLE_DEG = 10.0
+        P_GAIN = 4.0
+        MAX_ROT_SPEED = 0.5
+        MIN_ROT_SPEED = 0.1
+        REVERSE_SPEED = -0.2
+        
+        # 1. 마커 인식 활성화
+        for _ in range(3):
+            self.pub_dock_trigger.publish(Bool(data=True))
+            time.sleep(0.05)
+        time.sleep(1.0) # 인식 안정화 대기
+
+        # ------------------------------------------------------------------
+        # [Phase 1] 목표 각도 설정 및 제자리 정렬
+        # ------------------------------------------------------------------
+        target_angle_rad = math.radians(TARGET_ANGLE_DEG)
+        target_yaw = 0.0
+        
+        # Left/Right 문자열을 로직에 맞게 변환
+        # approach_side가 "Left"면 로봇 기준 우회전 필요 -> Target Negative
+        if approach_side == "Left":
+            target_yaw = -target_angle_rad
+            self.get_logger().info(f"🎯 Goal: Marker Orientation <= {math.degrees(target_yaw):.1f}°")
+        else:
+            target_yaw = target_angle_rad
+            self.get_logger().info(f"🎯 Goal: Marker Orientation >= {math.degrees(target_yaw):.1f}°")
+
+        start_time = self.get_clock().now()
+        
+        self.get_logger().info("🔄 Phase 1: In-Place Rotation Alignment...")
+        
+        while rclpy.ok():
+            # 타임아웃 60초
+            if (self.get_clock().now() - start_time).nanoseconds / 1e9 > 30.0:
+                self.get_logger().warn("⏰ Phase 1 Rotation Timeout!")
+                break
+            
+            # 데이터 수신 지연 체크
+            if (self.get_clock().now() - self.latest_pose_time).nanoseconds / 1e9 > 0.5:
+                self.stop_robot()
+                time.sleep(0.1)
+                continue
+
+            current_yaw = self.get_marker_orientation_yaw()
+            if current_yaw is None: 
+                time.sleep(0.1)
+                continue
+
+            current_deg = math.degrees(current_yaw)
+            target_deg = math.degrees(target_yaw)
+
+            # 종료 조건 체크
+            done = False
+            if approach_side == "Left":
+                if current_yaw <= target_yaw: done = True
+            else:
+                if current_yaw >= target_yaw: done = True
+            
+            if done:
+                self.get_logger().info(f"✅ Rotation Done! (Cur: {current_deg:.2f}°)")
+                break
+
+            # P 제어
+            error = current_yaw - target_yaw
+            speed = np.clip(-P_GAIN * error, -MAX_ROT_SPEED, MAX_ROT_SPEED)
+            
+            # 최소 속도 클램핑
+            if abs(speed) < MIN_ROT_SPEED:
+                speed = MIN_ROT_SPEED if speed > 0 else -MIN_ROT_SPEED
+
+            cmd = Twist()
+            cmd.angular.z = float(speed) # float 형변환 안전장치
+            self.pub_cmd_vel.publish(cmd)
+            
+            # 로그 출력 (스로틀링)
+            if self.latest_dock_pose:
+                curr_dist = self.latest_dock_pose.pose.position.z
+                self.get_logger().info(
+                    f"🔄 Rot | Dist: {curr_dist:.2f}m | Orient: {current_deg:.2f}° -> Goal: {target_deg:.1f}°", 
+                    throttle_duration_sec=0.5
+                )
+            
+            time.sleep(0.05) # 루프 주기 조절
+
+        self.stop_robot()
         time.sleep(0.5)
 
-        # --- Phase 2: 후진 (거리 확인) ---
-        self.get_logger().info("🔙 Undock: Reversing...")
+        # ------------------------------------------------------------------
+        # [Phase 2] 후진 및 자세 유지 (Active Yaw Correction)
+        # ------------------------------------------------------------------
+        self.get_logger().info("🔙 Phase 2: Reversing with Active Yaw Correction...")
         
-        if self.latest_dock_pose:
-            start_dist = self.latest_dock_pose.pose.position.z
-            target_dist = start_dist + reverse_dist
+        # 데이터 최신화 대기
+        while (self.get_clock().now() - self.latest_pose_time).nanoseconds / 1e9 > 0.5:
+            time.sleep(0.1)
+            
+        start_dist = self.latest_dock_pose.pose.position.z
+        # 인자로 받은 reverse_dist 사용 (기본 2.0m 권장)
+        final_target_dist = start_dist + reverse_dist
+        
+        rev_start = self.get_clock().now()
+        
+        while rclpy.ok():
+            if (self.get_clock().now() - rev_start).nanoseconds / 1e9 > 30.0:
+                self.get_logger().warn("⏰ Phase 2 Reverse Timeout!")
+                break
+            
+            # 마커 놓침 체크 -> 비상 정지
+            if (self.get_clock().now() - self.latest_pose_time).nanoseconds / 1e9 > 0.5:
+                self.stop_robot()
+                self.get_logger().warn("⚠️ Marker lost during reverse. Stopping Phase 2.")
+                break
+            
+            curr_dist = self.latest_dock_pose.pose.position.z
+            current_yaw = self.get_marker_orientation_yaw()
+            
+            # 목표 거리 도달 확인
+            if curr_dist >= final_target_dist:
+                self.get_logger().info(f"✅ Distance Reached: {curr_dist:.2f}m")
+                break
+            
+            # 각도 보정 (Phase 1과 동일 로직)
+            ang_speed = 0.0
+            if current_yaw is not None:
+                error = current_yaw - target_yaw
+                # 후진 중이므로 급격한 회전 제한 (Gain 3.0, Limit 0.3)
+                ang_speed = np.clip(-3.0 * error, -0.3, 0.3)
+                
+                # 데드존 (1도 미만 무시)
+                if abs(error) < math.radians(1.0):
+                    ang_speed = 0.0
+
+            cmd = Twist()
+            cmd.linear.x = REVERSE_SPEED
+            cmd.angular.z = float(ang_speed)
+            
+            self.pub_cmd_vel.publish(cmd)
+            
+            self.get_logger().info(
+                f"🔙 Rev | Dist: {curr_dist:.2f}m | YawErr: {math.degrees(current_yaw - target_yaw):.1f}°",
+                throttle_duration_sec=0.5
+            )
+            time.sleep(0.05)
+
+        self.stop_robot()
+        
+        # 마커 인식 끄기 (Phase 3는 Odom 사용하므로)
+        for _ in range(3):
+            self.pub_dock_trigger.publish(Bool(data=False))
+            time.sleep(0.05)
+
+        # ------------------------------------------------------------------
+        # [Phase 3] 90도(실제 170도) 회전 (Odom Feedback)
+        # ------------------------------------------------------------------
+        self.get_logger().info("🔄 Phase 3: Final Turn (Odom)...")
+        time.sleep(0.5)
+
+        # Odom 데이터 대기
+        wait_cnt = 0
+        while self.current_odom_yaw is None and wait_cnt < 20:
+            time.sleep(0.1)
+            wait_cnt += 1
+            
+        if self.current_odom_yaw is None:
+            self.get_logger().error("❌ No Odom data! Skipping final turn.")
+        else:
+            start_yaw = self.current_odom_yaw
+            target_rad = 3.0  # 약 170도
+            target_deg = math.degrees(target_rad)
+            
+            # 회전 방향 설정: Left Approach -> 좌회전(+), Right Approach -> 우회전(-)
+            rot_sign = 1.0 if approach_side == "Left" else -1.0
+            
+            cmd = Twist()
+            cmd.angular.z = 0.5 * rot_sign
+            
+            turn_start_time = self.get_clock().now()
             
             while rclpy.ok():
-                if self.latest_dock_pose:
-                    current_dist = self.latest_dock_pose.pose.position.z
-                    
-                    if current_dist >= target_dist:
-                        self.get_logger().info(f"✅ Undock Distance Reached ({current_dist:.2f}m)")
-                        break
-                        
-                    # 후진하면서 약간의 각도 보정 (선택 사항)
-                    lateral = -self.latest_dock_pose.pose.position.x
-                    dist_for_angle = self.latest_dock_pose.pose.position.z
-                    current_angle = np.arctan2(lateral, dist_for_angle)
-                    
-                    # 목표 각도 유지하며 후진
-                    angle_maintain_error = target_yaw_rad - current_angle
-                    
-                    cmd.linear.x = -0.15  # 후진 속도
-                    cmd.angular.z = np.clip(1.5 * angle_maintain_error, -0.2, 0.2)
-                    self.pub_cmd_vel.publish(cmd)
+                # 타임아웃 30초
+                if (self.get_clock().now() - turn_start_time).nanoseconds / 1e9 > 30.0:
+                    self.get_logger().warn("⏰ Phase 3 Turn Timeout!")
+                    break
+
+                if self.current_odom_yaw is None:
+                    time.sleep(0.05)
+                    continue
+
+                # 각도 차이 계산 (Wrap-around 처리 포함)
+                diff = self.current_odom_yaw - start_yaw
+                diff = math.atan2(math.sin(diff), math.cos(diff))
+                current_moved = abs(diff)
+
+                if current_moved >= target_rad:
+                    self.get_logger().info(f"✅ Turn Done: {math.degrees(current_moved):.1f}°")
+                    break
                 
-                # 마커 놓치면(거리가 너무 멀어지거나 시야 벗어남) 맹목적 후진 방지 위해 루프 탈출
-                else: 
-                     self.get_logger().warn("⚠️ Marker lost during undocking reverse.")
-                     break
-                     
-                rate.sleep()
+                self.pub_cmd_vel.publish(cmd)
+                
+                self.get_logger().info(
+                    f"🔄 Turning... {math.degrees(current_moved):.1f}° / {target_deg:.1f}°",
+                    throttle_duration_sec=0.5
+                )
+                time.sleep(0.05)
 
-        # 3. 종료 처리
-        self.pub_cmd_vel.publish(Twist()) # 정지
-        self.pub_dock_trigger.publish(Bool(data=False)) # 인식기 끄기
-        self.get_logger().info("🏁 Undocking Complete.")
-        return True
+        self.stop_robot()
+        self.get_logger().info("✅ Undocking Sequence Complete.")
 
+
+    # ===== 여기에 추가 =====
+    async def retry_action(self, action_func, max_retries=2, *args, **kwargs):
+        """액션 실패 시 자동 재시도 래퍼"""
+        for attempt in range(max_retries + 1):
+            result = await action_func(*args, **kwargs)
+            if result:
+                return True
+            if attempt < max_retries:
+                self.get_logger().warn(f"⚠️ Attempt {attempt+1} failed, retrying... ({max_retries - attempt} left)")
+                time.sleep(1.0)  # 재시도 전 잠시 대기
+        return False
+    
     # ---------------------------------------------------------
     # Helper: 액션 클라이언트 래퍼 (취소 연동 수정됨)
     # ---------------------------------------------------------
@@ -420,21 +607,42 @@ class HospitalOrchestrator(Node):
 
         res = result_future.result()
         return res.result.success
-    # ---------------------------------------------------------
-    # Main Workflow: Run Delivery
-    # ---------------------------------------------------------
+    # [main_controller.py] execute_delivery_callback 메서드를 아래 코드로 덮어쓰기
+
     async def execute_delivery_callback(self, goal_handle):
         request = goal_handle.request
         feedback = RunDelivery.Feedback()
         result = RunDelivery.Result()
         
-        # 1. 입력값 파싱
-        # task_mode가 비어있으면 기본값 "ALL" 처리
-        mode = request.task_mode if request.task_mode else "ALL"
+        # 1. 입력값 파싱 및 실행 계획 수립
+        raw_mode = request.task_mode if request.task_mode else "ALL"
         item_name = request.item_type
         clean_name = item_name.split('(')[0].strip()
+
+        # 전체 실행 순서 정의
+        FULL_SEQUENCE = [
+            "NAV_PICKUP", "DOCK_PICKUP", "PICK", 
+            "NAV_DROPOFF", "DOCK_DROPOFF", "PLACE", "NAV_HOME"
+        ]
         
-        # 2. 아이템 정보 로드
+        steps_to_run = set()
+
+        # [핵심 로직] 모드에 따른 실행 단계 설정
+        if raw_mode == "ALL":
+            steps_to_run = set(FULL_SEQUENCE)
+        elif raw_mode.endswith("_CONT"):
+            # 이어하기 모드: 해당 단계부터 끝까지
+            start_step = raw_mode.replace("_CONT", "")
+            if start_step in FULL_SEQUENCE:
+                start_idx = FULL_SEQUENCE.index(start_step)
+                steps_to_run = set(FULL_SEQUENCE[start_idx:])
+            else:
+                steps_to_run = {start_step} # 매칭 안되면 해당 단계만
+        else:
+            # 수동 모드: 딱 그 단계만 실행
+            steps_to_run = {raw_mode}
+
+        # 2. 아이템 정보 로드 (기존 동일)
         if clean_name in self.item_db:
             item_info = self.item_db[clean_name]
             target_id = item_info['id']
@@ -444,260 +652,212 @@ class HospitalOrchestrator(Node):
             target_id = 0
             grasp_offset = [0.0, 0.0, 0.0]
 
-        # 3. 좌표 및 접근 방향 미리 계산 (중간 단계 실행 시에도 필요함)
         pickup_pose, pickup_side = self.get_docking_pose(request.pickup_loc)
         dropoff_pose, dropoff_side = self.get_docking_pose(request.dropoff_loc)
         
-        self.get_logger().info(f"🚀 TASK START [Mode: {mode}] | Item: {clean_name}")
+        self.get_logger().info(f"🚀 TASK START [Req: {raw_mode}] | Steps: {len(steps_to_run)}")
 
         try:
             # =================================================
             # [STEP 1] 픽업지 이동 (NAV_PICKUP)
             # =================================================
-            if mode in ["ALL", "NAV_PICKUP"]:
+            if "NAV_PICKUP" in steps_to_run:
                 feedback.current_state = "NAVIGATING TO PICKUP"
                 goal_handle.publish_feedback(feedback)
                 
                 if not pickup_pose: raise Exception("Invalid Pickup Location")
                 self.get_logger().info(f"🚗 Navigating to {request.pickup_loc}...")
                 
-                if not await self.call_nav2(pickup_pose, goal_handle):
+                if not await self.retry_action(self.call_nav2, 1, pickup_pose, goal_handle):
                     raise Exception("Navigation to Pickup Failed")
-                
-                # 부분 실행이면 여기서 종료
-                if mode != "ALL": 
-                    goal_handle.succeed()
-                    result.success = True
-                    result.message = "Step 'NAV_PICKUP' Completed"
-                    return result
 
             if self.check_cancel(goal_handle, result): return result
 
             # =================================================
             # [STEP 2] 픽업지 도킹 (DOCK_PICKUP)
             # =================================================
-            if mode in ["ALL", "DOCK_PICKUP"]:
+            if "DOCK_PICKUP" in steps_to_run:
                 feedback.current_state = "DOCKING AT PICKUP"
                 goal_handle.publish_feedback(feedback)
                 
                 self.get_logger().info("⚓ Starting Precision Docking (Pickup)...")
-                if not await self.call_docking(goal_handle):
+                if not await self.retry_action(self.call_docking, 1, goal_handle):
                     raise Exception("Docking Failed")
-                
-                if mode != "ALL":
-                    goal_handle.succeed()
-                    result.success = True
-                    result.message = "Step 'DOCK_PICKUP' Completed"
-                    return result
 
             if self.check_cancel(goal_handle, result): return result
 
             # =================================================
             # [STEP 3] 물체 인식 및 파지 (PICK)
             # =================================================
-            if mode in ["ALL", "PICK"]:
+            if "PICK" in steps_to_run:
                 feedback.current_state = "SCANNING & PICKING"
                 goal_handle.publish_feedback(feedback)
                 
-                # 접근 방향의 반대쪽 카메라 선택 (기존 로직 유지)
                 camera_side = "Right" if pickup_side == "Left" else "Left"
                 self.get_logger().info(f"👀 Approach: {pickup_side} -> Using Camera: {camera_side}")
 
-                marker_raw_pose = await self.wait_for_marker(target_id, camera_side)
-                
-                if marker_raw_pose:
-                    self.get_logger().info(f"🔎 Applying Offset {grasp_offset}")
-                    # 1. 마커 위치 오프셋 계산 (위치만 계산)
-                    final_grasp_pose = self.apply_grasp_offset(marker_raw_pose, grasp_offset)
+                # [수정 포인트] 재시도 로직을 직접 구현하여, 실패 시 '마커 인식'부터 다시 수행
+                pick_success = False
+                max_retries = 2  # 최대 재시도 횟수 (총 3회)
 
-                    # 2. [수정] 접근 방향에 따라 그립 오리엔테이션 분기 적용
-                    # pickup_side는 get_docking_pose()에서 반환된 값 ("Left" or "Right")
-                    if pickup_side == "Left":
-                        # 로봇 기준 왼쪽에 있는 테이블 -> Left 전용 쿼터니언 사용
-                        final_grasp_pose.orientation = self.grasp_quat_right
-                        self.get_logger().info("🧭 Applying LEFT Grasp Orientation")
+                for attempt in range(max_retries + 1):
+                    self.get_logger().info(f"🔄 Pick Sequence Attempt {attempt + 1}/{max_retries + 1}")
+                    
+                    # 1. 마커 다시 인식 (매 시도마다 새로운 위치 갱신)
+                    marker_raw_pose = await self.wait_for_marker(target_id, camera_side)
+                    
+                    if marker_raw_pose:
+                        self.get_logger().info(f"🔎 Applying Offset {grasp_offset}")
+                        final_grasp_pose = self.apply_grasp_offset(marker_raw_pose, grasp_offset)
+
+                        if pickup_side == "Left":
+                            final_grasp_pose.orientation = self.grasp_quat_right
+                        else:
+                            final_grasp_pose.orientation = self.grasp_quat_left
+
+                        self.get_logger().info("🦾 Sending PICK Command...")
+                        
+                        # 2. 팔 이동 (여기서는 retry_action 대신 직접 호출)
+                        # 이미 밖에서 for문을 돌고 있으므로, 내부 재시도는 불필요
+                        if await self.call_arm('pick', goal_handle, final_grasp_pose):
+                            pick_success = True
+                            self.get_logger().info("✅ Pick Success!")
+                            break  # 성공 시 루프 탈출
+                        else:
+                            self.get_logger().warn("⚠️ Arm Move Failed. Retrying sequence...")
                     else:
-                        # 로봇 기준 오른쪽에 있는 테이블 -> Right 전용 쿼터니언 사용
-                        final_grasp_pose.orientation = self.grasp_quat_left
-                        self.get_logger().info("🧭 Applying RIGHT Grasp Orientation")
-
-                    self.get_logger().info("🦾 Sending PICK Command...")
-                    if not await self.call_arm('pick', goal_handle, final_grasp_pose):
-                        raise Exception("Pick Action Failed")
+                        self.get_logger().warn("⚠️ Marker not found. Retrying sequence...")
                     
-                    # 테이블 픽업 후 로봇 적재함에 싣기 (Stow)
-                    self.get_logger().info("📦 Stowing Item to Cargo Area...")
-                    
-                    stow_pose = PoseStamped()
-                    stow_pose.header.frame_id = "base_link"
-                    stow_pose.pose.position.x = -0.5
-                    stow_pose.pose.position.y = 0.0
-                    stow_pose.pose.position.z = 0.72
-                    # 요청한 Quaternion: x: -0.5, y: 0.5, z: 0.5, w: 0.5
-                    stow_pose.pose.orientation = Quaternion(x=-0.5, y=0.5, z=0.5, w=0.5)
+                    # 실패 시 잠시 대기 후 재시도
+                    time.sleep(1.0)
 
-                    if not await self.call_arm('place', goal_handle, stow_pose.pose):
-                        raise Exception("Stowing Action (Place to Cargo) Failed")
+                # 모든 시도 실패 시 예외 발생
+                if not pick_success:
+                    raise Exception("Pick Action Failed after retries (Vision+Arm)")
+                
+                # ---------------------------------------------------------
+                # 담기 (Stow) 동작은 비전 인식이 필요 없으므로 기존 방식 유지
+                # ---------------------------------------------------------
+                self.get_logger().info("📦 Stowing Item to Cargo Area...")
+                stow_pose = PoseStamped()
+                stow_pose.header.frame_id = "base_link"
+                stow_pose.pose.position.x = -0.5
+                stow_pose.pose.position.y = 0.0
+                stow_pose.pose.position.z = 0.72
+                stow_pose.pose.orientation = Quaternion(x=-0.5, y=0.5, z=0.5, w=0.5)
+
+                if not await self.retry_action(self.call_arm, 1, 'place', goal_handle, stow_pose.pose):
+                    raise Exception("Stowing Action Failed")
                 
                 self.get_logger().info("💤 Turning OFF Camera after PICK phase")
                 self.set_vision(camera_side, False)
                 
-                # ========== UNDOCKING SEQUENCE ==========
-                # 픽업 후 출발 전에 안전하게 언도킹 수행
-                # pickup_side 변수("Left" or "Right")를 그대로 활용
                 self.get_logger().info("⚓ Performing Post-Pick Undocking...")
-                await self.undock_using_marker(pickup_side, reverse_dist=0.6)
+                await self.undock_using_marker(pickup_side, reverse_dist=2.0)
+
+            if self.check_cancel(goal_handle, result): return result
 
             # =================================================
             # [STEP 4] 하역지 이동 (NAV_DROPOFF)
             # =================================================
-            if mode in ["ALL", "NAV_DROPOFF"]:
-                # 팔 접기 (안전)
+            if "NAV_DROPOFF" in steps_to_run:
                 await self.call_arm('home', goal_handle)
                 
                 feedback.current_state = "NAVIGATING TO DROPOFF"
                 goal_handle.publish_feedback(feedback)
                 
                 self.get_logger().info(f"🚗 Navigating to {request.dropoff_loc}...")
-                if not await self.call_nav2(dropoff_pose, goal_handle):
+                if not await self.retry_action(self.call_nav2, 1, dropoff_pose, goal_handle):
                     raise Exception("Navigation to Dropoff Failed")
-                
-                if mode != "ALL":
-                    goal_handle.succeed()
-                    result.success = True
-                    result.message = "Step 'NAV_DROPOFF' Completed"
-                    return result
             
             if self.check_cancel(goal_handle, result): return result
 
             # =================================================
             # [STEP 5] 하역지 도킹 (DOCK_DROPOFF)
             # =================================================
-            if mode in ["ALL", "DOCK_DROPOFF"]:
+            if "DOCK_DROPOFF" in steps_to_run:
                 feedback.current_state = "DOCKING AT DROPOFF"
                 goal_handle.publish_feedback(feedback)
                 
                 self.get_logger().info("⚓ Docking at Drop-off...")
-                if not await self.call_docking(goal_handle):
+                if not await self.retry_action(self.call_docking, 1, goal_handle):
                     raise Exception("Docking at Drop-off Failed")
-
-                if mode != "ALL":
-                    goal_handle.succeed()
-                    result.success = True
-                    result.message = "Step 'DOCK_DROPOFF' Completed"
-                    return result
 
             if self.check_cancel(goal_handle, result): return result
 
             # =================================================
             # [STEP 6] 내려놓기 (PLACE)
             # =================================================
-            if mode in ["ALL", "PLACE"]:
-                # [수정] 카메라 방향 결정 및 켜기 (변수 정의 문제 해결)
+            if "PLACE" in steps_to_run:
                 drop_camera_side = "Right" if dropoff_side == "Left" else "Left"
-                self.get_logger().info(f"👀 Turning ON {drop_camera_side} Camera for Monitoring...")
+                self.get_logger().info(f"👀 Turning ON {drop_camera_side} Camera...")
                 self.set_vision(drop_camera_side, True)
                 
-                # 적재함에서 물건 다시 집기 (Retrieve)
                 self.get_logger().info("📦 Retrieving Item from Cargo Area...")
-                
                 retrieve_pose = PoseStamped()
                 retrieve_pose.header.frame_id = "base_link"
                 retrieve_pose.pose.position.x = -0.5
                 retrieve_pose.pose.position.y = 0.0
                 retrieve_pose.pose.position.z = 0.7
-                # 요청한 Quaternion: x: -0.5, y: 0.5, z: 0.5, w: 0.5
                 retrieve_pose.pose.orientation = Quaternion(x=-0.5, y=0.5, z=0.5, w=0.5)
 
-                if not await self.call_arm('pick', goal_handle, retrieve_pose.pose):
-                    raise Exception("Retrieving Action (Pick from Cargo) Failed")
+                if not await self.retry_action(self.call_arm, 1, 'pick', goal_handle, retrieve_pose.pose):
+                    raise Exception("Retrieving Action Failed")
                 
                 feedback.current_state = "PLACING"
                 goal_handle.publish_feedback(feedback)
                 
-                # 1. 고정 좌표 설정 (Base Link 기준)
                 place_pose = PoseStamped()
                 place_pose.header.frame_id = "base_link"
                 place_pose.pose.position.x = -0.16
                 place_pose.pose.position.z = 1.0
 
-                # 2. 접근 방향(dropoff_side)에 따른 Y좌표 및 오리엔테이션 분기
-                # (현재 위치가 하역장이므로 pickup_side가 아닌 dropoff_side를 사용)
                 if dropoff_side == "Left":
                     place_pose.pose.position.y = -0.8
                     place_pose.pose.orientation = self.grasp_quat_right
-                    self.get_logger().info("🧭 PLACING: Left Approach -> Right Quat, Y=-0.8")
-                else: # Right
+                else: 
                     place_pose.pose.position.y = 0.8
                     place_pose.pose.orientation = self.grasp_quat_left
-                    self.get_logger().info("🧭 PLACING: Right Approach -> Left Quat, Y=+0.8")
 
-                # 3. 마커 인식 없이 바로 Place 명령 전송
-                self.get_logger().info(f"🦾 Sending FIXED PLACE Command... (y={place_pose.pose.position.y})")
-                if not await self.call_arm('place', goal_handle, place_pose.pose):
+                self.get_logger().info(f"🦾 Sending FIXED PLACE Command...")
+                if not await self.retry_action(self.call_arm, 1, 'place', goal_handle, place_pose.pose):
                     raise Exception("Place Action Failed")
                 
-                # 끝나면 팔 접기
                 await self.call_arm('home', goal_handle)
                 
-                # [추가] PLACE 페이즈 완료 후 끄기
-                self.get_logger().info("💤 Turning OFF Camera after PLACE phase")
+                self.get_logger().info("💤 Turning OFF Camera")
                 self.set_vision(drop_camera_side, False)
                 
-                # ========== UNDOCKING SEQUENCE ==========
-                # 픽업 후 출발 전에 안전하게 언도킹 수행
                 self.get_logger().info("⚓ Performing Post-Pick Undocking...")
-                await self.undock_using_marker(dropoff_side, reverse_dist=0.6)
-
-                if mode != "ALL":
-                    goal_handle.succeed()
-                    result.success = True
-                    result.message = "Step 'PLACE' Completed"
-                    return result
+                await self.undock_using_marker(dropoff_side, reverse_dist=2.0)
 
             # =================================================
-            # [STEP 8] 시작 위치 복귀 (NAV_HOME)
+            # [STEP 7] 시작 위치 복귀 (NAV_HOME)
             # =================================================
-            if mode in ["ALL", "NAV_HOME"]:
+            if "NAV_HOME" in steps_to_run:
                 feedback.current_state = "RETURNING HOME"
                 goal_handle.publish_feedback(feedback)
 
-                # 홈 좌표 설정
                 home_pose = PoseStamped()
                 home_pose.header.frame_id = "map"
                 home_pose.pose.position.x = self.home_coords[0]
                 home_pose.pose.position.y = self.home_coords[1]
                 home_pose.pose.position.z = self.home_coords[2]
-                # 방향은 원점 보게 하거나 기본값 (w=1.0)
                 home_pose.pose.orientation.w = 1.0 
 
-                self.get_logger().info(f"🏠 Returning to Home {self.home_coords}...")
-                
-                # Nav2 이동
-                if not await self.call_nav2(home_pose, goal_handle):
+                self.get_logger().info(f"🏠 Returning to Home...")
+                if not await self.retry_action(self.call_nav2, 1, home_pose, goal_handle):
                     raise Exception("Return to Home Failed")
-
-                if mode != "ALL":
-                    goal_handle.succeed()
-                    result.success = True
-                    result.message = "Step 'NAV_HOME' Completed"
-                    return result
             
-            # =================================================
-            # [STEP 7] 홈 위치 복귀 (HOME) - 유틸리티
-            # =================================================
-            if mode == "HOME":
+            # [유틸리티] HOME (단독 실행용)
+            if "HOME" in steps_to_run and raw_mode == "HOME":
                 self.get_logger().info("🏠 Moving Arm to HOME...")
                 await self.call_arm('home', goal_handle)
-                goal_handle.succeed()
-                result.success = True
-                result.message = "Arm Homed"
-                return result
 
-            # 여기까지 오면 ALL 모드의 전체 완료
-            self.get_logger().info("✅ Full Delivery Sequence Complete!")
+            # 여기까지 오면 성공
+            self.get_logger().info("✅ Full Sequence or Step Complete!")
             result.success = True
-            result.message = "All tasks finished."
+            result.message = f"Tasks {list(steps_to_run)} Completed."
             goal_handle.succeed()
 
         except Exception as e:
