@@ -53,6 +53,10 @@ class DockPosePublisher(Node):
         status = "ON" if self.is_active else "OFF"
         self.get_logger().info(f"🔄 Tracking Status Changed: {status}")
         
+        # 비활성화 신호를 받으면 즉시 창 닫기
+        if not self.is_active:
+            cv2.destroyAllWindows()
+        
     def image_callback(self, msg):
         try:
             # ROS Image -> OpenCV Image 변환 (부하 적음)

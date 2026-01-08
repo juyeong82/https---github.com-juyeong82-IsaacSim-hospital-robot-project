@@ -3,7 +3,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient, ActionServer, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from geometry_msgs.msg import PoseStamped, Quaternion
+from geometry_msgs.msg import PoseStamped, Quaternion, Twist
 from std_msgs.msg import Bool
 import math
 import time
@@ -33,6 +33,9 @@ class HospitalOrchestrator(Node):
             "Sub Pharmacy": {"coords": [-2.5, 5.07121, 0.0], "approach": "Left"},
             "Clinical Lab (Zone C)":   {"coords": [23.129, 9.392, 0.0], "approach": "Right"}, # 테스트용 (우측접근)
         }
+        
+        # [추가] 복귀할 홈 위치 좌표 [x, y, z] (여기만 수정하면 됨)
+        self.home_coords = [0.0, 0.0, 0.0]
 
         # 오프셋 기준: 마커 중심으로부터 [x(우), y(하/위), z(앞/뒤)] (OpenCV 좌표계 기준 아님, 마커 자체 로컬 좌표계)
         # ---------------------------------------------------------
@@ -88,20 +91,30 @@ class HospitalOrchestrator(Node):
         # Vision Control Publishers
         self.pub_enable_left = self.create_publisher(Bool, '/vision/enable_left', 10)
         self.pub_enable_right = self.create_publisher(Bool, '/vision/enable_right', 10)
+        
+        # 후진(Undocking)을 위한 cmd_vel 퍼블리셔
+        self.pub_cmd_vel = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # Vision Data Subscribers (일회성 수신용)
         self.detected_markers = {} # ID별 Pose 저장
         self.create_subscription(MarkerArray, '/vision/left_markers', self.vision_cb_left, 10, callback_group=self.cb_group)
         self.create_subscription(MarkerArray, '/vision/right_markers', self.vision_cb_right, 10, callback_group=self.cb_group)
+        
+        # 언도킹 제어를 위한 정밀 마커 포즈 구독 (april_pose_publisher 데이터)
+        self.latest_dock_pose = None
+        self.create_subscription(PoseStamped, 'detected_dock_pose', self.dock_pose_callback, 10, callback_group=self.cb_group)
+
+        # 마커 인식기(april_pose_publisher) On/Off 제어용
+        self.pub_dock_trigger = self.create_publisher(Bool, '/docking/trigger', 10)
 
         self.get_logger().info("🏥 Hospital Main Node Ready (Waiting for UI Command...)")
 
-    # [추가] Action Server 취소 요청 수락 콜백
+    # Action Server 취소 요청 수락 콜백
     def cancel_callback(self, goal_handle):
         self.get_logger().info('⚠️ Received Cancel Request!')
         return CancelResponse.ACCEPT
 
-    # [추가] 실행 중 취소 여부 확인 헬퍼 함수
+    # 실행 중 취소 여부 확인 헬퍼 함수
     def check_cancel(self, goal_handle, result):
         if goal_handle.is_cancel_requested:
             goal_handle.canceled()
@@ -111,7 +124,7 @@ class HospitalOrchestrator(Node):
             return True # 취소됨
         return False # 취소 안됨
 
-    # [수정] PoseStamped를 받아서 frame_id를 유지하도록 변경
+    # PoseStamped를 받아서 frame_id를 유지하도록 변경
     def apply_grasp_offset(self, base_pose_stamped, offset_xyz):
         """
         base_pose_stamped: PoseStamped 객체 (header 포함)
@@ -236,6 +249,103 @@ class HospitalOrchestrator(Node):
             self.get_logger().error("❌ Marker detection failed (Timeout)")
         
         return found_pose
+    
+    # [추가] 마커 포즈 콜백 (언도킹용)
+    def dock_pose_callback(self, msg):
+        self.latest_dock_pose = msg
+
+    # [추가] 마커 기반 정밀 언도킹 (회전 -> 후진)
+    async def undock_using_marker(self, approach_side, reverse_dist=0.6):
+        """
+        approach_side: "Left" (테이블이 로봇 오른쪽) 또는 "Right" (테이블이 로봇 왼쪽)
+        reverse_dist: 후진할 거리 (미터)
+        """
+        self.get_logger().info(f"🔙 Starting Undocking Sequence (Side: {approach_side})")
+        
+        # 1. 마커 인식기 켜기
+        self.pub_dock_trigger.publish(Bool(data=True))
+        time.sleep(1.0) # 인식 안정화 대기
+        
+        # 2. 목표 회전 각도 설정 (10도 = 약 0.17 라디안)
+        # Left 접근(테이블 오른쪽) -> 로봇 머리를 오른쪽으로(CW) -> Target Yaw: -10도
+        # Right 접근(테이블 왼쪽) -> 로봇 머리를 왼쪽으로(CCW) -> Target Yaw: +10도
+        target_yaw_deg = -10.0 if approach_side == "Left" else 10.0
+        target_yaw_rad = math.radians(target_yaw_deg)
+        
+        cmd = Twist()
+        rate = self.create_rate(20) # 20Hz
+        
+        # --- Phase 1: 제자리 회전 (마커 기준 정렬) ---
+        self.get_logger().info(f"🔄 Undock: Rotating to {target_yaw_deg} deg...")
+        start_time = time.time()
+        
+        while rclpy.ok() and (time.time() - start_time < 5.0): # 최대 5초 시도
+            if self.latest_dock_pose:
+                # 현재 마커와의 각도(Bearing) 계산
+                # (april_docking_marker 로직과 동일하게 계산)
+                lateral = -self.latest_dock_pose.pose.position.x
+                distance = self.latest_dock_pose.pose.position.z
+                current_yaw = np.arctan2(lateral, distance)
+                
+                yaw_error = target_yaw_rad - current_yaw
+                
+                # 오차 2도 이내면 정지
+                if abs(yaw_error) < math.radians(2.0):
+                    break
+                
+                # P제어 회전
+                cmd.linear.x = 0.0
+                cmd.angular.z = np.clip(2.0 * yaw_error, -0.4, 0.4)
+                self.pub_cmd_vel.publish(cmd)
+            else:
+                # 마커 놓침 방지 (잠시 정지)
+                self.pub_cmd_vel.publish(Twist())
+                
+            rate.sleep()
+            
+        # 정지
+        self.pub_cmd_vel.publish(Twist())
+        time.sleep(0.5)
+
+        # --- Phase 2: 후진 (거리 확인) ---
+        self.get_logger().info("🔙 Undock: Reversing...")
+        
+        if self.latest_dock_pose:
+            start_dist = self.latest_dock_pose.pose.position.z
+            target_dist = start_dist + reverse_dist
+            
+            while rclpy.ok():
+                if self.latest_dock_pose:
+                    current_dist = self.latest_dock_pose.pose.position.z
+                    
+                    if current_dist >= target_dist:
+                        self.get_logger().info(f"✅ Undock Distance Reached ({current_dist:.2f}m)")
+                        break
+                        
+                    # 후진하면서 약간의 각도 보정 (선택 사항)
+                    lateral = -self.latest_dock_pose.pose.position.x
+                    dist_for_angle = self.latest_dock_pose.pose.position.z
+                    current_angle = np.arctan2(lateral, dist_for_angle)
+                    
+                    # 목표 각도 유지하며 후진
+                    angle_maintain_error = target_yaw_rad - current_angle
+                    
+                    cmd.linear.x = -0.15  # 후진 속도
+                    cmd.angular.z = np.clip(1.5 * angle_maintain_error, -0.2, 0.2)
+                    self.pub_cmd_vel.publish(cmd)
+                
+                # 마커 놓치면(거리가 너무 멀어지거나 시야 벗어남) 맹목적 후진 방지 위해 루프 탈출
+                else: 
+                     self.get_logger().warn("⚠️ Marker lost during undocking reverse.")
+                     break
+                     
+                rate.sleep()
+
+        # 3. 종료 처리
+        self.pub_cmd_vel.publish(Twist()) # 정지
+        self.pub_dock_trigger.publish(Bool(data=False)) # 인식기 끄기
+        self.get_logger().info("🏁 Undocking Complete.")
+        return True
 
     # ---------------------------------------------------------
     # Helper: 액션 클라이언트 래퍼 (취소 연동 수정됨)
@@ -254,7 +364,7 @@ class HospitalOrchestrator(Node):
             
         result_future = nav_goal_handle.get_result_async()
         
-        # [핵심] 결과가 나올 때까지 기다리면서, 메인 취소 요청이 들어오는지 감시
+        # 결과가 나올 때까지 기다리면서, 메인 취소 요청이 들어오는지 감시
         while not result_future.done():
             if main_goal_handle.is_cancel_requested:
                 self.get_logger().warn("🛑 Cancelling Nav2 because Main Task was Canceled...")
@@ -431,6 +541,12 @@ class HospitalOrchestrator(Node):
                 
                 self.get_logger().info("💤 Turning OFF Camera after PICK phase")
                 self.set_vision(camera_side, False)
+                
+                # ========== UNDOCKING SEQUENCE ==========
+                # 픽업 후 출발 전에 안전하게 언도킹 수행
+                # pickup_side 변수("Left" or "Right")를 그대로 활용
+                self.get_logger().info("⚓ Performing Post-Pick Undocking...")
+                await self.undock_using_marker(pickup_side, reverse_dist=0.6)
 
             # =================================================
             # [STEP 4] 하역지 이동 (NAV_DROPOFF)
@@ -477,6 +593,11 @@ class HospitalOrchestrator(Node):
             # [STEP 6] 내려놓기 (PLACE)
             # =================================================
             if mode in ["ALL", "PLACE"]:
+                # [수정] 카메라 방향 결정 및 켜기 (변수 정의 문제 해결)
+                drop_camera_side = "Right" if dropoff_side == "Left" else "Left"
+                self.get_logger().info(f"👀 Turning ON {drop_camera_side} Camera for Monitoring...")
+                self.set_vision(drop_camera_side, True)
+                
                 # 적재함에서 물건 다시 집기 (Retrieve)
                 self.get_logger().info("📦 Retrieving Item from Cargo Area...")
                 
@@ -522,6 +643,11 @@ class HospitalOrchestrator(Node):
                 # [추가] PLACE 페이즈 완료 후 끄기
                 self.get_logger().info("💤 Turning OFF Camera after PLACE phase")
                 self.set_vision(drop_camera_side, False)
+                
+                # ========== UNDOCKING SEQUENCE ==========
+                # 픽업 후 출발 전에 안전하게 언도킹 수행
+                self.get_logger().info("⚓ Performing Post-Pick Undocking...")
+                await self.undock_using_marker(dropoff_side, reverse_dist=0.6)
 
                 if mode != "ALL":
                     goal_handle.succeed()
@@ -529,6 +655,34 @@ class HospitalOrchestrator(Node):
                     result.message = "Step 'PLACE' Completed"
                     return result
 
+            # =================================================
+            # [STEP 8] 시작 위치 복귀 (NAV_HOME)
+            # =================================================
+            if mode in ["ALL", "NAV_HOME"]:
+                feedback.current_state = "RETURNING HOME"
+                goal_handle.publish_feedback(feedback)
+
+                # 홈 좌표 설정
+                home_pose = PoseStamped()
+                home_pose.header.frame_id = "map"
+                home_pose.pose.position.x = self.home_coords[0]
+                home_pose.pose.position.y = self.home_coords[1]
+                home_pose.pose.position.z = self.home_coords[2]
+                # 방향은 원점 보게 하거나 기본값 (w=1.0)
+                home_pose.pose.orientation.w = 1.0 
+
+                self.get_logger().info(f"🏠 Returning to Home {self.home_coords}...")
+                
+                # Nav2 이동
+                if not await self.call_nav2(home_pose, goal_handle):
+                    raise Exception("Return to Home Failed")
+
+                if mode != "ALL":
+                    goal_handle.succeed()
+                    result.success = True
+                    result.message = "Step 'NAV_HOME' Completed"
+                    return result
+            
             # =================================================
             # [STEP 7] 홈 위치 복귀 (HOME) - 유틸리티
             # =================================================
