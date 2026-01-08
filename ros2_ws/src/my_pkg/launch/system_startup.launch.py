@@ -10,7 +10,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         
-        # 1. 아루코 디텍터 (Front Camera)
+        # 1. 아루코 디텍터 (right Camera)
         Node(
             package=package_name,
             executable='aruco_detector_right',

@@ -106,7 +106,7 @@ class UndockTestNode(Node):
         # ------------------------------------------------------------------
         target_angle_rad = math.radians(TARGET_ANGLE_DEG)
         
-        if side == 'L':
+        if side == 'R':
             # Left Approach -> 로봇 우회전 필요 -> 마커 기준 각도(Yaw) 감소(또는 증가, 좌표계 따름)
             # 기존 로직: Target < -10도 (또는 +10도) 
             # (사용자 기존 코드 기준: L -> Target +10도 이하로 내려가거나 올라가는 로직)
@@ -140,7 +140,7 @@ class UndockTestNode(Node):
 
             # 종료 조건 체크
             done = False
-            if side == 'L': 
+            if side == 'R': 
                 if current_yaw <= target_yaw: done = True 
             else:           
                 if current_yaw >= target_yaw: done = True 

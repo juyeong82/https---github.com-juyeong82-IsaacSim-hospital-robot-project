@@ -57,7 +57,7 @@ class ArmActionServer(Node):
         self.verify_pose_left.header.frame_id = "base_link"
         self.verify_pose_left.pose.position.x = -0.4
         self.verify_pose_left.pose.position.y = 0.7  # 좌측
-        self.verify_pose_left.pose.position.z = 1.1
+        self.verify_pose_left.pose.position.z = 1.15
         self.verify_pose_left.pose.orientation.w = 0.707
         self.verify_pose_left.pose.orientation.y = 0.707
         self.verify_pose_left.pose.orientation.x = 0.0
@@ -68,7 +68,7 @@ class ArmActionServer(Node):
         self.verify_pose_right.header.frame_id = "base_link"
         self.verify_pose_right.pose.position.x = -0.4
         self.verify_pose_right.pose.position.y = -0.7 # 우측
-        self.verify_pose_right.pose.position.z = 1.1
+        self.verify_pose_right.pose.position.z = 1.15
         self.verify_pose_right.pose.orientation.x = -0.707
         self.verify_pose_right.pose.orientation.y = 0.0
         self.verify_pose_right.pose.orientation.z = 0.707
@@ -277,7 +277,7 @@ class ArmActionServer(Node):
                 
                 # 5. [Lift] 수직 상승
                 lift_pose = copy.deepcopy(target_pose)
-                lift_pose.pose.position.z += 0.20
+                lift_pose.pose.position.z += 0.30
                 
                 self.get_logger().info("⬆️ Lifting Object...")
                 self.publish_pose(lift_pose)

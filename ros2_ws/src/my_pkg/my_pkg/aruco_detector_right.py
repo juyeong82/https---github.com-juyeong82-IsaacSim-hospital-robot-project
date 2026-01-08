@@ -10,6 +10,7 @@ from moma_interfaces.msg import MarkerArray, MarkerInfo
 import tf2_geometry_msgs
 from scipy.spatial.transform import Rotation
 from std_msgs.msg import Bool
+from tf2_ros import Time
 
 class ArucoDetector(Node):
     def __init__(self):
@@ -164,7 +165,7 @@ class ArucoDetector(Node):
                     # PoseStamped 설정 (카메라 좌표계)
                     p_cam = PoseStamped()
                     p_cam.header.frame_id = source_frame
-                    p_cam.header.stamp = msg.header.stamp
+                    p_cam.header.stamp = rclpy.time.Time(seconds=0).to_msg()
                     
                     # 계산된 T_cam_target에서 위치 추출
                     p_cam.pose.position.x = T_cam_target[0, 3]
@@ -197,6 +198,7 @@ class ArucoDetector(Node):
 
                     self.get_logger().info(f"ID {ids[i][0]}: Transformed Pose -> {info.pose.position.x:.3f}, {info.pose.position.y:.3f}, {info.pose.position.z:.3f}")
                 except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
+                    self.get_logger().warn(f"TF Error (ID {ids[i][0]}): {e}") # 에러 내용 출력
                     continue
             # [추가됨] 루프가 끝난 후 한 번에 전송
             if len(marker_array.markers) > 0:

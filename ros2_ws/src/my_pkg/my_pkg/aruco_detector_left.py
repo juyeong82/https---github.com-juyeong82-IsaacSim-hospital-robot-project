@@ -10,6 +10,8 @@ from moma_interfaces.msg import MarkerArray, MarkerInfo
 import tf2_geometry_msgs
 from scipy.spatial.transform import Rotation
 from std_msgs.msg import Bool
+from tf2_ros import Time
+
 
 class ArucoDetector(Node):
     def __init__(self):
@@ -164,7 +166,7 @@ class ArucoDetector(Node):
                     # PoseStamped 설정 (카메라 좌표계)
                     p_cam = PoseStamped()
                     p_cam.header.frame_id = source_frame
-                    p_cam.header.stamp = msg.header.stamp
+                    p_cam.header.stamp = rclpy.time.Time(seconds=0).to_msg()
                     
                     # 계산된 T_cam_target에서 위치 추출
                     p_cam.pose.position.x = T_cam_target[0, 3]

@@ -42,13 +42,47 @@ class HospitalOrchestrator(Node):
         # ---------------------------------------------------------
         # [설정] 방 별 테이블 중심 좌표 (UI에서 주는 정보라 가정)
         # 형식: "Room Name": {"coords": [x, y, z], "approach": "Left" or "Right"}
+        # self.room_db = {
+        #     "Nurse Station A (Base)":  {"coords": [23.129, 9.392, 0.0], "approach": "Left"},
+        #     "Ward 102":                {"coords": [24.62435, 14.62949, 0.0], "approach": "Left"},
+        #     "Main Pharmacy (Central)": {"coords": [-9.0, 5.07121, 0.0], "approach": "Left"},
+        #     "Sub Pharmacy": {"coords": [-2.5, 5.07121, 0.0], "approach": "Left"},
+        #     "Clinical Lab (Zone C)":   {"coords": [23.129, 9.392, 0.0], "approach": "Right"}, # 테스트용 (우측접근)
+        # }
+        
         self.room_db = {
-            "Nurse Station A (Base)":  {"coords": [23.129, 9.392, 0.0], "approach": "Left"},
-            "Ward 102":                {"coords": [24.62435, 14.62949, 0.0], "approach": "Left"},
-            "Main Pharmacy (Central)": {"coords": [-9.0, 5.07121, 0.0], "approach": "Left"},
-            "Sub Pharmacy": {"coords": [-2.5, 5.07121, 0.0], "approach": "Left"},
-            "Clinical Lab (Zone C)":   {"coords": [23.129, 9.392, 0.0], "approach": "Right"}, # 테스트용 (우측접근)
+            "Nurse Station A (Base)":  {
+                "coords": [23.129, 9.392, 0.0], 
+                "direction": "East",   # 맵의 +x 방향을 보며 정차
+                "work_side": "Left"    # 로봇의 왼쪽에 테이블이 있음
+            },
+            "Ward 102": {
+                "coords": [24.62435, 14.62949, 0.0], 
+                "direction": "East",  # 맵의 +x 방향을 보며 정차
+                "work_side": "Right"   # 로봇의 오른쪽에 테이블이 있음
+            },
+            "Ward 105": {
+                "coords": [13.37842, 10.91591, 0.0], 
+                "direction": "West",  # 맵의 +x 방향을 보며 정차
+                "work_side": "Left"   # 로봇의 오른쪽에 테이블이 있음
+            },
+            "Main Pharmacy (Central)": {
+                "coords": [-9.0, 5.07121, 0.0], 
+                "direction": "West",   # 맵의 -x (왼쪽) 방향을 보며 정차
+                "work_side": "Left"
+            },
+            "Sub Pharmacy": {
+                "coords": [-2.5, 5.07121, 0.0], 
+                "direction": "West",  # 맵의 -x 방향을 보며 정차
+                "work_side": "Right"   # 로봇의 오른쪽에 테이블이 있음
+            },
+            "Clinical Lab (Zone C)": {
+                "coords": [-11.61633, 16.26268, 0.0], 
+                "direction": "North",  # 맵의 -x 방향을 보며 정차
+                "work_side": "Right"   # 로봇의 오른쪽에 테이블이 있음
+            },
         }
+        
         
         # [추가] 복귀할 홈 위치 좌표 [x, y, z] (여기만 수정하면 됨)
         self.home_coords = [0.0, 0.0, 0.0]
@@ -74,8 +108,17 @@ class HospitalOrchestrator(Node):
         # Left Approach 기준 (User Provided)
         # Table: (23.129, 9.392) -> Dock: (25.603, 8.400)
         # Diff: X +2.474, Y -0.992
-        self.offset_x = 2.474
-        self.offset_y = 1.2 # 절대값으로 저장 (Left: -y, Right: +y 적용 예정)
+        self.dock_offset_parallel = 2.0  # 로봇 진행 방향으로 더 가야하는 거리
+        self.dock_offset_perp = 1.3        # 테이블과 로봇 사이의 수직 거리 (간격)
+
+        # 쿼터니언 프리셋 (도킹 시 로봇이 바라볼 자세)
+        # 방향별 yaw 각도를 미리 정의
+        self.direction_yaw = {
+            "East":  0.0,            
+            "West":  math.pi,        # 180도
+            "North": math.pi / 2,    # 90도
+            "South": -math.pi / 2    # -90도
+        }
         
         self.quat_left = Quaternion(x=-0.000, y=-0.000, z=0.996, w=0.087)
         self.quat_right = Quaternion(x=-0.000, y=0.000, z=0.996, w=-0.087)
@@ -191,38 +234,81 @@ class HospitalOrchestrator(Node):
     # ---------------------------------------------------------
     # Helper: 좌표 계산 로직
     # ---------------------------------------------------------
+    # ---------------------------------------------------------
+    # Helper: 좌표 계산 로직 (벡터 회전 적용)
+    # ---------------------------------------------------------
     def get_docking_pose(self, room_name):
-        """테이블 좌표와 접근 방향을 기반으로 도킹 좌표 계산"""
+        """
+        수정 사항: 위치는 테이블 정렬에 맞추되, 
+        로봇의 헤딩(Yaw)은 테이블 쪽으로 10도 더 틀어서 마커 포착률을 높임.
+        """
         if room_name not in self.room_db:
             self.get_logger().error(f"❌ Unknown Room: {room_name}")
             return None, None
 
         info = self.room_db[room_name]
         tx, ty, tz = info['coords']
-        approach = info['approach']
+        direction = info['direction']
+        work_side = info['work_side']
 
+        # ---------------------------------------------------------
+        # 1. 위치 계산 (기존 로직 유지: 맵 정렬 기준)
+        # ---------------------------------------------------------
+        # 테이블이 놓인 절대 방향 (East=0, West=180...)
+        table_align_yaw = self.direction_yaw.get(direction, 0.0)
+
+        base_dx = -self.dock_offset_parallel
+        base_dy = -self.dock_offset_perp if work_side == "Left" else self.dock_offset_perp
+
+        # 위치 회전은 '테이블 정렬 각도'를 기준으로 해야 복도 튀어 나가는걸 방지함
+        cos_a = math.cos(table_align_yaw)
+        sin_a = math.sin(table_align_yaw)
+
+        rotated_dx = base_dx * cos_a - base_dy * sin_a
+        rotated_dy = base_dx * sin_a + base_dy * cos_a
+
+        final_x = tx + rotated_dx
+        final_y = ty + rotated_dy
+        
+        # # ---------------------------------------------------------
+        # # 2. 바라보는 각도 수정 (Toe-in 적용)
+        # # ---------------------------------------------------------
+        # # 10도(라디안) 설정
+        # bias_rad = math.radians(10.0) 
+        
+        # # 작업 방향에 따라 안쪽으로 틀기
+        # # Left 작업 (테이블이 왼쪽) -> 왼쪽으로 조금 더 돌기 (+)
+        # # Right 작업 (테이블이 오른쪽) -> 오른쪽으로 조금 더 돌기 (-)
+        # if work_side == "Left":
+        #     final_robot_yaw = table_align_yaw + bias_rad
+        # else:
+        #     final_robot_yaw = table_align_yaw - bias_rad
+
+        # ---------------------------------------------------------
+        # 3. 최종 Pose 생성
+        # ---------------------------------------------------------
         pose = PoseStamped()
         pose.header.frame_id = "map"
         pose.header.stamp = self.get_clock().now().to_msg()
         
-        # 오프셋 적용
-        # 현재 맵 기준 X축은 동일하게 증가, Y축만 접근 방향에 따라 반전된다고 가정
-        final_x = tx + self.offset_x
-        
-        if approach == "Left":
-            final_y = ty - self.offset_y
-            pose.pose.orientation = self.quat_left
-        else: # Right
-            final_y = ty + self.offset_y
-            pose.pose.orientation = self.quat_right
-            
         pose.pose.position.x = final_x
         pose.pose.position.y = final_y
         pose.pose.position.z = 0.0
         
-        self.get_logger().info(f"📍 Calculated Dock Pose for {room_name} ({approach}): ({final_x:.2f}, {final_y:.2f})")
-        return pose, approach
+        # 쿼터니언은 '비틀어진 각도(final_robot_yaw)'를 사용
+        q = Rotation.from_euler('z', final_robot_yaw).as_quat()
+        pose.pose.orientation.x = q[0]
+        pose.pose.orientation.y = q[1]
+        pose.pose.orientation.z = q[2]
+        pose.pose.orientation.w = q[3]
 
+        self.get_logger().info(
+            f"📍 Dock Pose [{room_name}]: Dir={direction}, Side={work_side}\n"
+            f"   Position -> ({final_x:.2f}, {final_y:.2f}) (Aligned to Corridor)\n"
+            f"   Heading  -> {math.degrees(final_robot_yaw):.1f}° (Tilted 10° towards Table)"
+        )
+        
+        return pose, work_side
     # ---------------------------------------------------------
     # Helper: 비전 콜백 및 제어
     # ---------------------------------------------------------
@@ -313,7 +399,7 @@ class HospitalOrchestrator(Node):
         self.get_logger().info(f"\n🚀 Starting Precision Undock: {approach_side} Side")
         
         # 설정값 정의 (테스트 노드 값 준수)
-        TARGET_ANGLE_DEG = 10.0
+        TARGET_ANGLE_DEG = 15.0
         P_GAIN = 4.0
         MAX_ROT_SPEED = 0.5
         MIN_ROT_SPEED = 0.1
@@ -333,7 +419,7 @@ class HospitalOrchestrator(Node):
         
         # Left/Right 문자열을 로직에 맞게 변환
         # approach_side가 "Left"면 로봇 기준 우회전 필요 -> Target Negative
-        if approach_side == "Left":
+        if approach_side == "Right":
             target_yaw = -target_angle_rad
             self.get_logger().info(f"🎯 Goal: Marker Orientation <= {math.degrees(target_yaw):.1f}°")
         else:
@@ -366,7 +452,7 @@ class HospitalOrchestrator(Node):
 
             # 종료 조건 체크
             done = False
-            if approach_side == "Left":
+            if approach_side == "Right":
                 if current_yaw <= target_yaw: done = True
             else:
                 if current_yaw >= target_yaw: done = True
@@ -416,15 +502,16 @@ class HospitalOrchestrator(Node):
         rev_start = self.get_clock().now()
         
         while rclpy.ok():
-            if (self.get_clock().now() - rev_start).nanoseconds / 1e9 > 30.0:
+            if (self.get_clock().now() - rev_start).nanoseconds / 1e9 > 60.0:
                 self.get_logger().warn("⏰ Phase 2 Reverse Timeout!")
                 break
             
-            # 마커 놓침 체크 -> 비상 정지
+            # 마커 놓침 체크 -> 비상 정지   
             if (self.get_clock().now() - self.latest_pose_time).nanoseconds / 1e9 > 0.5:
-                self.stop_robot()
-                self.get_logger().warn("⚠️ Marker lost during reverse. Stopping Phase 2.")
-                break
+                # 마커 놓치면 위험하므로 정지 (혹은 직진만 할 수도 있으나 안전상 정지 권장)
+                self.stop_robot() 
+                self.get_logger().warn("⚠️ Marker lost during reverse. Stopping.")
+                continue
             
             curr_dist = self.latest_dock_pose.pose.position.z
             current_yaw = self.get_marker_orientation_yaw()
@@ -483,8 +570,9 @@ class HospitalOrchestrator(Node):
             target_rad = 3.0  # 약 170도
             target_deg = math.degrees(target_rad)
             
-            # 회전 방향 설정: Left Approach -> 좌회전(+), Right Approach -> 우회전(-)
-            rot_sign = 1.0 if approach_side == "Left" else -1.0
+            # Left Approach(왼쪽에 벽) -> 우회전(-) 해서 나가야 함
+            # Right Approach(오른쪽에 벽) -> 좌회전(+) 해서 나가야 함
+            rot_sign = -1.0 if approach_side == "Left" else 1.0
             
             cmd = Twist()
             cmd.angular.z = 0.5 * rot_sign
@@ -693,7 +781,8 @@ class HospitalOrchestrator(Node):
                 feedback.current_state = "SCANNING & PICKING"
                 goal_handle.publish_feedback(feedback)
                 
-                camera_side = "Right" if pickup_side == "Left" else "Left"
+                # 수정: 작업 방향이 Left(왼쪽 테이블)면 -> Left Camera 사용
+                camera_side = pickup_side
                 self.get_logger().info(f"👀 Approach: {pickup_side} -> Using Camera: {camera_side}")
 
                 # [수정 포인트] 재시도 로직을 직접 구현하여, 실패 시 '마커 인식'부터 다시 수행
@@ -710,10 +799,13 @@ class HospitalOrchestrator(Node):
                         self.get_logger().info(f"🔎 Applying Offset {grasp_offset}")
                         final_grasp_pose = self.apply_grasp_offset(marker_raw_pose, grasp_offset)
 
+                        # 수정된 Pick 내부 로직
                         if pickup_side == "Left":
-                            final_grasp_pose.orientation = self.grasp_quat_right
+                            # 테이블이 왼쪽 -> 카메라도 왼쪽 -> 그리퍼도 왼쪽을 봐야 함
+                            final_grasp_pose.orientation = self.grasp_quat_left 
                         else:
-                            final_grasp_pose.orientation = self.grasp_quat_left
+                            # 테이블이 오른쪽 -> 카메라도 오른쪽 -> 그리퍼도 오른쪽을 봐야 함
+                            final_grasp_pose.orientation = self.grasp_quat_right
 
                         self.get_logger().info("🦾 Sending PICK Command...")
                         
@@ -789,7 +881,7 @@ class HospitalOrchestrator(Node):
             # [STEP 6] 내려놓기 (PLACE)
             # =================================================
             if "PLACE" in steps_to_run:
-                drop_camera_side = "Right" if dropoff_side == "Left" else "Left"
+                drop_camera_side = dropoff_side
                 self.get_logger().info(f"👀 Turning ON {drop_camera_side} Camera...")
                 self.set_vision(drop_camera_side, True)
                 
@@ -813,11 +905,11 @@ class HospitalOrchestrator(Node):
                 place_pose.pose.position.z = 1.0
 
                 if dropoff_side == "Left":
-                    place_pose.pose.position.y = -0.8
-                    place_pose.pose.orientation = self.grasp_quat_right
+                    place_pose.pose.position.y = 0.8   # Left면 +y(왼쪽)으로 이동
+                    place_pose.pose.orientation = self.grasp_quat_left # 왼쪽 보기
                 else: 
-                    place_pose.pose.position.y = 0.8
-                    place_pose.pose.orientation = self.grasp_quat_left
+                    place_pose.pose.position.y = -0.8  # Right면 -y(오른쪽)으로 이동
+                    place_pose.pose.orientation = self.grasp_quat_right # 오른쪽 보기
 
                 self.get_logger().info(f"🦾 Sending FIXED PLACE Command...")
                 if not await self.retry_action(self.call_arm, 1, 'place', goal_handle, place_pose.pose):
